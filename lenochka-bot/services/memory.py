@@ -354,6 +354,68 @@ def search_memory(query: str, db_path: str, brain=None) -> list[dict]:
         conn.close()
 
 
+def format_expansion_for_tg(expansion: dict) -> str:
+    """Форматировать entity expansion для Telegram (HTML-safe)."""
+    parts = []
+
+    # Контакты
+    for cid, c in expansion.get("contacts", {}).items():
+        line = f"👤 <b>{_esc(c['name'])}</b>"
+        if c.get("tg_username"):
+            line += f" (@{_esc(c['tg_username'])})"
+        if c.get("company"):
+            line += f", {_esc(c['company'])}"
+        parts.append(line)
+
+    # Сделки
+    for did, d in expansion.get("deals", {}).items():
+        amount = f"{d['amount']:,.0f}₽" if d.get("amount") else "?"
+        line = f"💰 {amount} — <i>{_esc(d['stage'])}</i>"
+        if d.get("expected_close_at"):
+            line += f" (до {d['expected_close_at'][:10]})"
+        if d.get("contact_name"):
+            line += f" — {_esc(d['contact_name'])}"
+        parts.append(line)
+
+    # Задачи
+    tasks = expansion.get("tasks", [])
+    if tasks:
+        task_lines = []
+        for t in tasks[:5]:
+            icon = "🔴" if t["priority"] == "urgent" else "🟡" if t["priority"] == "high" else "⚪"
+            due = f" (до {t['due_at'][:10]})" if t.get("due_at") else ""
+            task_lines.append(f"  {icon} {_esc(t['description'][:50])}{due}")
+        parts.append("📋 <b>Задачи:</b>\n" + "\n".join(task_lines))
+
+    # История
+    memories = expansion.get("memories", [])
+    if memories:
+        mem_lines = []
+        for m in memories[:4]:
+            mem_lines.append(f"  • {_esc(m['content'][:80])}")
+        parts.append("🧠 <b>История:</b>\n" + "\n".join(mem_lines))
+
+    # Контекст чата
+    messages = expansion.get("messages", [])
+    if messages:
+        msg_lines = []
+        for m in reversed(messages[-3:]):
+            msg_lines.append(f"  [{_esc(m['author'])}: {_esc(m['text'][:60])}]")
+        parts.append("💬 <b>Чат:</b>\n" + "\n".join(msg_lines))
+
+    if not parts:
+        return ""
+
+    return "📎 <b>Связанный контекст:</b>\n" + "\n".join(parts)
+
+
+def _esc(text: str) -> str:
+    """HTML-escape для Telegram."""
+    if not text:
+        return ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def run_consolidation(db_path: str, brain=None):
     """Запустить консолидацию памяти."""
     if brain and brain.is_ready():

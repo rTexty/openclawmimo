@@ -150,14 +150,21 @@ async def cmd_find(message: Message, brain, is_owner: bool = False, **kwargs):
         await message.answer("Ничего не найдено.")
         return
 
+    # Основные результаты
     lines = []
+    entity_block = ""
     for r in results:
+        if r.get("source") == "entity_expansion" and r.get("_expansion"):
+            # Entity context — форматируем отдельным блоком
+            entity_block = mem.format_expansion_for_tg(r["_expansion"])
+            continue
         lines.append(f"• [{r.get('type', '?')}] {r['content'][:80]}")
 
-    await message.answer(
-        "🔍 <b>Результаты:</b>\n\n" + "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-    )
+    text = "🔍 <b>Результаты:</b>\n\n" + "\n".join(lines)
+    if entity_block:
+        text += "\n\n" + entity_block
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("help"))
