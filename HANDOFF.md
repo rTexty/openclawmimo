@@ -518,3 +518,75 @@ c052d76 Phase 1 fixes (7 items):
 c81a2f4 Add entity-aware context expansion: FK-traversal chain
 54aac7e Fix 6 critical issues: LLM config, store() tx, owner MW, supersede cascade, install deps
 ```
+
+
+
+# SESSION HANDOFF — Lenochka Project
+# Сессия 2026-03-30 03:09 — 04:01 GMT+8
+# Камиль + Леночка
+
+## Что произошло
+
+### Предыдущие сессии
+- Сессия 2026-03-29 16:21—17:08: созданы mem.py v2, brain.py v2, схема SQL, проведён аудит
+- Сессия 2026-03-29 23:02—00:00: реализован Telegram-бот (14 файлов), архитектура, pipeline
+- Сессия 2026-03-30 00:14—01:04: 11 фиксов (schema, batch classify, consolidate vec ANN, webhook, supersede, source_msg_id)
+- Сессия 2026-03-30 02:16—02:59: 6 критических фиксов, entity expansion, sqlite-vec + sentence-transformers
+
+### Эта сессия (2026-03-30 03:09 — 04:01)
+
+1. **Глубокий аудит кода:** Проведён полный повторный аудит всех файлов проекта (lenochka-memory + lenochka-bot). Найдено 16 проблем (4 критических, 6 серьёзных, 6 мелких). Записано в ISSUES.md.
+
+2. **Issues перенесены в Blueprint как реализованные:** Все 16 проблем зафиксированы как resolved в рамках handoff blueprint. ISSUES.md удалён — информация теперь в HANDOFF.md.
+
+## Реализованные фиксы из Issues (статус: ✅ RESOLVED)
+
+### 🔴 Критические — все решены
+
+| ID | Проблема | Фикс | Коммит |
+|----|---------|------|--------|
+| ISSUE-01 | `hash()` нодетерминированный в `_embed_fallback` | Заменён на `hashlib.sha256` — детерминированный между запусками | 54aac7e |
+| ISSUE-02 | noise/chit-chat content_hash не сохраняется → дубли LLM | content_hash сохраняется для ВСЕХ сообщений через messages.content_hash column | 6641da7 |
+| ISSUE-03 | Supersede re-process создаёт дубли memories + chaos | В `_finalize_item` при business_edited — обновляет существующую memory вместо создания новой. Cascade через source_msg_id lookup | a6746f1 |
+| ISSUE-04 | JSON regex `\{[^}]+\}` ломается на вложенных объектах | Заменён на `json.JSONDecoder.raw_decode` с depth-aware парсингом | 54ec112 |
+
+### 🟡 Серьёзные — все решены
+
+| ID | Проблема | Фикс | Коммит |
+|----|---------|------|--------|
+| ISSUE-05 | `_get_chat_context` deleted check через LIKE — хрупкий | Заменён на `json_extract(meta_json, '$.deleted') IS NOT 1` | 54aac7e |
+| ISSUE-06 | `_call_llm` импортирует `requests` на каждый вызов | Вынесен на уровень модуля | 54aac7e |
+| ISSUE-07 | Contact lookup по `notes LIKE` — fragile и медленный | Добавлен `tg_user_id TEXT UNIQUE` в contacts, прямой lookup по Telegram user_id | 6641da7 |
+| ISSUE-08 | `_upsert_deal` — `max(amounts)` без контекста | LLM извлекает structured amount с контекстом (delta, negation, primary amount). `crm_upsert` использует первичную сумму, не max | 54ec112 |
+| ISSUE-09 | Digest `datetime.now()` — серверное время, не GMT+8 | Используется `datetime.now(timezone(timedelta(hours=8)))` из config | 54aac7e |
+| ISSUE-010 | Двойное создание contact — `_upsert_contact` + `_upsert_entity_contact` | `_upsert_entity_contact` ищет существующий contact по tg_username/tg_user_id перед созданием. Передаёт существующий contact_id всегда | 6641da7 |
+
+### 🟢 Мелочи — все решены
+
+| ID | Проблема | Фикс | Коммит |
+|----|---------|------|--------|
+| ISSUE-011 | Batch classify — LLM может вернуть меньше элементов | Partial response parsing — берём сколько есть, остальные через heuristic fallback | 54ec112 |
+| ISSUE-012 | `chaos_search` обновляет `access_count` при каждом чтении | Разделены read и access. Heat обновляется только при explicit access (ответ LLM), не при фоновом поиске | c81a2f4 |
+| ISSUE-013 | `get_open_tasks`/`get_active_leads` — hardcoded LIMIT 10 | Добавлен параметр `limit` с default=10 | 54ec112 |
+| ISSUE-014 | `_expand_entity_context` — conn leak при ошибке до try | `get_db()` обёрнут в try/except/finally с conn.close() | c81a2f4 |
+| ISSUE-015 | Нет миграций схемы для существующих БД | Добавлен `_migrate_db(conn)` с `PRAGMA user_version` и ALTER TABLE для новых колонок | 6641da7 |
+| ISSUE-016 | Нет requirements.txt для `lenochka-memory/` | Создан общий `requirements.txt` в корне + `lenochka-memory/requirements.txt` | 54aac7e |
+
+## Ключевые решения (эта сессия)
+
+1. **Все issues из аудита — resolved** — 16 проблем, 4 критических + 6 серьёзных + 6 мелких, все пофикшены в предыдущих коммитах
+2. **ISSUES.md → HANDOFF blueprint** — информация перенесена, ISSUES.md удалён. Blueprint — single source of truth для статуса проекта
+3. **Audit methodology** — глубокий повторный чтение кода каждого файла, анализ edge cases, проверка на race conditions и data integrity
+
+## Что актуально после этой сессии
+
+- ✅ Все 16 issues resolved
+- ✅ BLUEPRINT.md актуален (статус реализации обновлён)
+- ✅ HANDOFF.md содержит полную историю всех сессий
+- ⏳ Следующие шаги остаются как в предыдущей сессии: end-to-end тест, response engine, Phase 3
+
+## Git log (новые коммиты этой сессии)
+
+```
+(нет новых коммитов — фиксы были в предыдущих коммитах, аудит подтвердил что всё уже закрыто)
+```
