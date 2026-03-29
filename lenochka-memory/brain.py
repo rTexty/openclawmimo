@@ -773,6 +773,54 @@ def build_context_packet(query, contact_id=None, deal_id=None,
                 "data": {"content": m["content"], "importance": m["importance"]},
             })
 
+    # 6. Entity expansion — цепочка по FK-связям (contact → deal → tasks → history)
+    try:
+        import mem as _mem
+        top_for_expansion = packet["episodes"][:5] + [
+            {"id": r.get("id"), "source": r.get("source")}
+            for r in packet["related"][:3]
+        ]
+        expansion = _mem._expand_entity_context(top_for_expansion, conn=conn)
+        if expansion:
+            # Добавляем entity context как structured data
+            if expansion["contacts"]:
+                for cid, c in expansion["contacts"].items():
+                    packet["facts"].append({
+                        "type": "contact",
+                        "data": c,
+                    })
+            if expansion["deals"]:
+                for did, d in expansion["deals"].items():
+                    packet["facts"].append({
+                        "type": "deal",
+                        "data": d,
+                    })
+            if expansion["tasks"]:
+                packet["notes"].append({
+                    "type": "tasks",
+                    "content": "; ".join(
+                        f"[{t['priority']}] {t['description'][:50]}"
+                        for t in expansion["tasks"][:5]
+                    ),
+                })
+            if expansion["memories"]:
+                for m in expansion["memories"][:3]:
+                    packet["notes"].append({
+                        "type": "related_memory",
+                        "content": m["content"][:100],
+                    })
+            if expansion["messages"]:
+                msg_text = " | ".join(
+                    f"{m['author']}: {m['text'][:60]}"
+                    for m in reversed(expansion["messages"][-3:])
+                )
+                packet["notes"].append({
+                    "type": "chat_context",
+                    "content": msg_text,
+                })
+    except Exception as e:
+        pass  # entity expansion — nice-to-have, не критично
+
     conn.close()
     return packet
 
