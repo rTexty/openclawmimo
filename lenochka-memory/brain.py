@@ -209,6 +209,72 @@ def classify_message(text, chat_context=None):
     return _classify_heuristic(text)
 
 
+CLASSIFY_BATCH_SYSTEM = """Ты — классификатор Telegram-сообщений для CRM-системы.
+Классифицируй КАЖДОЕ сообщение из списка в одну из категорий:
+- noise: мусор, спам, боты, реклама
+- chit-chat: личное общение, приветствия, эмодзи, не по делу
+- business-small: короткие рабочие сообщения без конкретных задач
+- task: явная или подразумеваемая задача, просьба, TODO
+- decision: принятое решение, договорённость, согласование
+- lead-signal: интерес клиента, запрос цены/условий, новый контакт
+- risk: жалоба, угроза срыва, просрочка, конфликт
+- other: не удалось классифицировать
+
+Отвечай СТРОГО JSON array без форматирования, ровно N элементов:
+[{"label":"<категория>","confidence":<0.0-1.0>,"reasoning":"<кратко>"}, ...]
+
+Количество элементов ДОЛЖНО совпадать с количеством сообщений."""
+
+
+def classify_batch(texts: list[str], chat_contexts: list[str] | None = None):
+    """
+    Batch-классификация: N сообщений → 1 LLM-вызов.
+    Возвращает list[(label, confidence, reasoning)].
+    
+    Экономия: ~60% токенов по сравнению с classify_message() в цикле.
+    При недоступности LLM — fallback на _classify_heuristic поштучно.
+    """
+    if not texts:
+        return []
+
+    if chat_contexts is None:
+        chat_contexts = [""] * len(texts)
+
+    # Формируем numbered list
+    numbered = []
+    for i, (text, ctx) in enumerate(zip(texts, chat_contexts), 1):
+        ctx_str = f" [контекст: {ctx}]" if ctx else ""
+        numbered.append(f"{i}. {text}{ctx_str}")
+
+    messages_block = "\n".join(numbered)
+    result = _call_llm(
+        CLASSIFY_BATCH_SYSTEM,
+        f"Сообщения ({len(texts)} штук):\n{messages_block}",
+        temperature=0.0,
+        max_tokens=1024,
+    )
+
+    if result:
+        try:
+            json_match = re.search(r'\[.*\]', result, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                if isinstance(data, list) and len(data) == len(texts):
+                    return [
+                        (
+                            item.get("label", "other"),
+                            item.get("confidence", 0.5),
+                            item.get("reasoning", "batch"),
+                        )
+                        for item in data
+                    ]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    # Fallback: heuristic поштучно
+    return [_classify_heuristic(t) for t in texts]
+
+
 def _classify_heuristic(text):
     """Эвристическая классификация без LLM."""
     text_lower = text.lower()

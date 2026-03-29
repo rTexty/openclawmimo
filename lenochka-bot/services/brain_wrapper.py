@@ -22,6 +22,7 @@ class BrainWrapper:
 
     def __init__(self):
         self._classify_message = None
+        self._classify_batch = None
         self._extract_entities = None
         self._embed_text = None
         self._embed_texts_batch = None
@@ -45,6 +46,7 @@ class BrainWrapper:
         import mem
 
         self._classify_message = brain.classify_message
+        self._classify_batch = brain.classify_batch
         self._extract_entities = brain.extract_entities
         self._embed_text = brain.embed_text
         self._embed_texts_batch = brain.embed_texts_batch
@@ -71,6 +73,10 @@ class BrainWrapper:
 
     def classify_message(self, text: str, chat_context: str | None = None):
         return self._classify_message(text, chat_context)
+
+    def classify_batch(self, texts: list[str], chat_contexts: list[str] | None = None):
+        """Batch classify: N сообщений → 1 LLM-вызов."""
+        return self._classify_batch(texts, chat_contexts)
 
     def extract_entities(self, text: str, label: str | None = None,
                          chat_context: str | None = None):

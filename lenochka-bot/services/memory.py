@@ -1,6 +1,6 @@
 """
 Memory Service — обёртка над mem.py для bot-специфичных операций.
-Dedup, store message, soft-delete, status queries.
+Dedup, store message, soft-delete, status queries, business connections.
 """
 import sqlite3
 import logging
@@ -18,18 +18,18 @@ def content_hash(text: str) -> str:
 def dedup_check(msg: Message, normalized_text: str, db_path: str) -> str | None:
     """
     Проверка дубликата. Возвращает content_hash если НЕ дубликат, None если дубль.
-    Проверяет: source_message_id + chat_id и content_hash.
+    Проверяет: source_message_id + chat_id и content_hash (за 24ч).
     """
     ch = content_hash(normalized_text)
     conn = get_db(db_path)
     try:
-        # Check source_message_id
+        # Check source_message_id + chat_thread_id
         existing = conn.execute(
-            """SELECT id FROM memories
-               WHERE source_message_id = ? AND chat_thread_id = (
-                   SELECT id FROM chat_threads WHERE tg_chat_id = ?
-               )""",
-            (msg.message_id, str(msg.chat.id)),
+            """SELECT m.id FROM messages m
+               JOIN chat_threads ct ON m.chat_thread_id = ct.id
+               WHERE ct.tg_chat_id = ? AND m.meta_json LIKE ?
+               LIMIT 1""",
+            (str(msg.chat.id), f'%"{msg.message_id}"%'),
         ).fetchone()
         if existing:
             return None
@@ -56,12 +56,17 @@ def store_message(chat_thread_id: int, from_user_id: str, text: str,
     import json
     conn = get_db(db_path)
     try:
+        # Сохраняем source_msg_id в meta_json для дедупликации
+        full_meta = meta or {}
+        full_meta["_source_msg_id"] = source_msg_id
+        full_meta["_content_hash"] = content_hash_val
+
         conn.execute(
             """INSERT INTO messages (chat_thread_id, from_user_id, text, sent_at,
-                                     classification, meta_json)
-               VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, ?)""",
+                                     classification, analyzed, meta_json)
+               VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, 0, ?)""",
             (chat_thread_id, from_user_id, text, sent_at,
-             None, json.dumps(meta) if meta else None),
+             None, json.dumps(full_meta)),
         )
         mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
@@ -71,38 +76,110 @@ def store_message(chat_thread_id: int, from_user_id: str, text: str,
 
 
 def soft_delete_messages(chat_id: int, message_ids: list[int], db_path: str):
-    """Soft-delete: помечаем удалённые сообщения."""
+    """
+    Soft-delete: помечаем удалённые сообщения.
+    
+    Архитектурное решение: meta_json.deleted=1 вместо физического удаления.
+    Это сохраняет целостность FK (memories.source_message_id → messages.id).
+    Позже — отдельный cron для физической архивации старых deleted.
+    """
+    if not message_ids:
+        return
     conn = get_db(db_path)
     try:
-        placeholders = ",".join("?" * len(message_ids))
-        conn.execute(
-            f"""UPDATE messages SET meta_json = json_set(
-                    COALESCE(meta_json, '{{}}'), '$.deleted', 1
-                )
-                WHERE id IN ({placeholders})""",
-            message_ids,
-        )
+        # Ищем internal message id по source_msg_id в meta_json
+        for msg_id in message_ids:
+            conn.execute(
+                """UPDATE messages SET meta_json = json_set(
+                        COALESCE(meta_json, '{}'), '$.deleted', 1
+                   )
+                   WHERE meta_json LIKE ?""",
+                (f'%"{msg_id}"%',),
+            )
         conn.commit()
+        logger.info(f"Soft-deleted {len(message_ids)} messages in chat {chat_id}")
     finally:
         conn.close()
 
 
 def get_business_status(user_id: int, db_path: str) -> dict:
-    """Статус business-подключения."""
-    # Пока заглушка — будет таблица business_connections
-    return {"connected": False}
+    """Статус business-подключения из реальной таблицы."""
+    conn = get_db(db_path)
+    try:
+        row = conn.execute(
+            """SELECT connection_id, status, can_reply, can_read_messages
+               FROM business_connections
+               WHERE owner_user_id = ? AND status = 'active'
+               ORDER BY connected_at DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+        if row:
+            return {
+                "connected": True,
+                "connection_id": row["connection_id"],
+                "can_reply": bool(row["can_reply"]),
+                "can_read": bool(row["can_read_messages"]),
+            }
+        return {"connected": False}
+    finally:
+        conn.close()
 
 
 def register_business_connection(user_id: int, connection_id: str,
                                   can_reply: bool, can_read: bool, db_path: str):
-    """Зарегистрировать подключение business-аккаунта."""
-    logger.info(f"Business connected: user={user_id}, conn={connection_id}, "
-                f"can_reply={can_reply}, can_read={can_read}")
+    """Зарегистрировать подключение business-аккаунта в БД."""
+    conn = get_db(db_path)
+    try:
+        conn.execute("""
+            INSERT INTO business_connections 
+                (connection_id, owner_user_id, status, can_reply, can_read_messages)
+            VALUES (?, ?, 'active', ?, ?)
+            ON CONFLICT(connection_id) DO UPDATE SET
+                status = 'active',
+                can_reply = excluded.can_reply,
+                can_read_messages = excluded.can_read_messages,
+                revoked_at = NULL
+        """, (connection_id, user_id, int(can_reply), int(can_read)))
+        conn.commit()
+        logger.info(
+            f"Business connected: user={user_id}, conn={connection_id}, "
+            f"can_reply={can_reply}, can_read={can_read}"
+        )
+    finally:
+        conn.close()
 
 
 def revoke_business_connection(connection_id: str, db_path: str):
     """Отозвать подключение."""
-    logger.info(f"Business revoked: conn={connection_id}")
+    conn = get_db(db_path)
+    try:
+        conn.execute("""
+            UPDATE business_connections
+            SET status = 'revoked', revoked_at = datetime('now')
+            WHERE connection_id = ?
+        """, (connection_id,))
+        conn.commit()
+        logger.info(f"Business revoked: conn={connection_id}")
+    finally:
+        conn.close()
+
+
+def get_owner_by_connection(connection_id: str, db_path: str) -> int | None:
+    """
+    Маппинг business_connection_id → owner_user_id.
+    Критично для определения кому принадлежит входящее сообщение
+    при мульти-юзерной конфигурации.
+    """
+    conn = get_db(db_path)
+    try:
+        row = conn.execute(
+            """SELECT owner_user_id FROM business_connections
+               WHERE connection_id = ? AND status = 'active'""",
+            (connection_id,),
+        ).fetchone()
+        return row["owner_user_id"] if row else None
+    finally:
+        conn.close()
 
 
 def get_status_summary(db_path: str) -> dict:

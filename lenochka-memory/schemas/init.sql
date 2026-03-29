@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT,
     sent_at DATETIME NOT NULL,
     classification TEXT CHECK(classification IN ('noise', 'chit-chat', 'business-small', 'task', 'decision', 'lead-signal', 'risk', 'other')),
+    analyzed INTEGER DEFAULT 0,
     meta_json TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent ON messages(sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_class ON messages(classification);
+CREATE INDEX IF NOT EXISTS idx_messages_analyzed ON messages(analyzed);
 
 CREATE TABLE IF NOT EXISTS leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +128,24 @@ CREATE TABLE IF NOT EXISTS payments (
     status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'confirmed', 'failed')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ============================================
+-- СЛОЙ 1.5: TELEGRAM BUSINESS CONNECTIONS
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS business_connections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL UNIQUE,
+    owner_user_id INTEGER NOT NULL,
+    status TEXT DEFAULT 'active' CHECK(status IN ('active', 'revoked')),
+    can_reply INTEGER DEFAULT 0,
+    can_read_messages INTEGER DEFAULT 1,
+    connected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    revoked_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_biz_conn_owner ON business_connections(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_biz_conn_status ON business_connections(status);
 
 -- ============================================
 -- СЛОЙ 2: AGENT MEMORY (Когнитивная память)
