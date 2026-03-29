@@ -578,11 +578,40 @@ c81a2f4 Add entity-aware context expansion: FK-traversal chain
 2. **ISSUES.md → HANDOFF blueprint** — информация перенесена, ISSUES.md удалён. Blueprint — single source of truth для статуса проекта
 3. **Audit methodology** — глубокий повторный чтение кода каждого файла, анализ edge cases, проверка на race conditions и data integrity
 
+## Оценка готовности (моя субъективная)
+
+| Слой | Готовность | Комментарий |
+|------|-----------|-------------|
+| CRM-БД (схема) | 95% | 15 таблиц, бизнес_connections, FTS5, vec. Не хватает миграций — уже есть. |
+| Agent Memory (mem.py) | 90% | store/recall/ingest/consolidate работают. Осталось: batch embeds в consolidate (есть, но не везде). |
+| Brain (brain.py) | 85% | classify, extract, embed, RAPTOR. Осталось: proper JSON extraction (partial fix есть), batch classify стабильность. |
+| Telegram-бот (lenochka-bot) | 80% | 16 файлов, pipeline, CRM upsert, supersede, owner auth. Не тестировался в живую — нет .env + реального запуска. |
+| Normalize layer | 90% | Все типы сообщений, emoji mapping, reply/forward контекст. Нет voice transcription и OCR (Phase 4). |
+| Response engine | 0% | Не реализован. Это главный gap — бот принимает, но не отвечает. |
+| Scheduler / Digest | 70% | Генерация работает, отправка в Telegram — нет. Нет cron триггера. |
+| Multi-user | 10% | business_connections таблица есть, но изоляция не реализована. |
+| Тесты | 0% | Нет ни unit, ни integration тестов. |
+
+**Общая оценка: ~60% готовности к минимальному рабочему продукту (MVP).**
+
+- Ядро памяти и CRM — близки к продакшену
+- Telegram-бот — реализован, но не обкатан
+- Главная дыра — response engine (нет ответов пользователю)
+- Следующий рубеж — запустить бота вживую, получить первые real-world данные, потом строить response engine
+
+**Что нужно для MVP (первый работающий продукт):**
+1. `.env` + запуск бота вживую (1 день)
+2. End-to-end тест: сообщение → CRM (1 день)
+3. Response engine: should_respond + generate_response (3-5 дней)
+4. Digest delivery в Telegram (1 день)
+
+**~1 неделя до MVP**, если фокус на эти 4 пункта.
+
 ## Что актуально после этой сессии
 
 - ✅ Все 16 issues resolved
 - ✅ BLUEPRINT.md актуален (статус реализации обновлён)
-- ✅ HANDOFF.md содержит полную историю всех сессий
+- ✅ HANDOFF.md содержит полную историю всех сессий + оценку готовности
 - ⏳ Следующие шаги остаются как в предыдущей сессии: end-to-end тест, response engine, Phase 3
 
 ## Git log (новые коммиты этой сессии)
