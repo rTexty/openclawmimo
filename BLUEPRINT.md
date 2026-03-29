@@ -1,26 +1,32 @@
 # Lenochka Blueprint — Полная карта проекта
 
 > Документ создан 2026-03-29. Описывает всё: что есть, что сломается, к чему стремиться.
-> **Последнее обновление: 2026-03-29 23:56 GMT+8** — реализован Telegram-бот.
+> **Последнее обновление: 2026-03-30 01:04 GMT+8** — architecture fixes, webhook, supersede, batch classify.
 
 ## СТАТУС РЕАЛИЗАЦИИ (актуально)
 
 | Компонент | Статус | Файлы |
 |-----------|--------|-------|
-| CRM-БД (SQLite) | ✅ Готова | `lenochka-memory/schemas/init.sql` |
+| CRM-БД (SQLite) | ✅ Готова | `lenochka-memory/schemas/init.sql` (15 таблиц + business_connections) |
 | Agent Memory | ✅ Работает | `lenochka-memory/mem.py` + `brain.py` |
 | CHAOS Search | ✅ Работает | `lenochka-memory/mem.py` |
-| Telegram-бот | ✅ Реализован (14 файлов) | `lenochka-bot/` |
+| Telegram-бот | ✅ Реализован (15 файлов) | `lenochka-bot/` |
 | Normalize Layer | ✅ Все типы сообщений | `lenochka-bot/services/normalizer.py` |
 | CRM Upsert | ✅ contacts/deals/leads/tasks | `lenochka-bot/services/crm_upsert.py` |
 | Brain Wrapper (daemon) | ✅ Модель один раз | `lenochka-bot/services/brain_wrapper.py` |
-| Pipeline (async queue) | ✅ Batching + dedup | `lenochka-bot/services/pipeline.py` |
+| Pipeline (async queue) | ✅ Batch classify + batch embed + supersede | `lenochka-bot/services/pipeline.py` |
 | Scheduler | ✅ Digest/weekly/consolidate | `lenochka-bot/services/scheduler.py` |
+| Webhook mode | ✅ Polling + webhook (aiohttp) | `lenochka-bot/__main__.py` |
+| Supersede (edited) | ✅ source_msg_id lookup + text update | `lenochka-bot/services/memory.py` |
+| Soft-delete | ✅ source_msg_id lookup | `lenochka-bot/services/memory.py` |
+| Business connections | ✅ DB table + CRUD | `lenochka-bot/services/memory.py` |
+| Batch classify | ✅ N messages → 1 LLM call | `lenochka-memory/brain.py` (`classify_batch`) |
+| Consolidate vec ANN | ✅ O(n·k) вместо O(n²) | `lenochka-memory/mem.py` |
 | Архитектура | ✅ Задокументирована | `ARCHITECTURE-TELEGRAM-BOT.md` |
 | Response Engine | ❌ Не реализован | Phase 3 |
 | Voice Transcription | ❌ Не реализован | Phase 4 |
 | OCR | ❌ Не реализован | Phase 4 |
-| Multi-user | ❌ Не реализован | Phase 4 |
+| Multi-user | ❌ Не реализован (infra готова: business_connections table) | Phase 4 |
 
 ---
 
