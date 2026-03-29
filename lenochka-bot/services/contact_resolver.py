@@ -27,21 +27,26 @@ def resolve_contact(msg: Message, source: str, db_path: str) -> tuple[int | None
 
 def _upsert_contact(conn: sqlite3.Connection, msg: Message,
                      source: str) -> int | None:
-    """Telegram user → CRM contact (upsert)."""
+    """
+    Telegram user → CRM contact (upsert).
+    
+    ВАЖНО: сохраняем ОБЕ стороны диалога.
+    - sender_business_bot заполнен → это сообщение от владельца (Камиля)
+    - sender_business_bot пуст → это сообщение от собеседника (клиента)
+    """
     user = msg.from_user
     if not user:
         return None
 
-    # Business message: владелец аккаунта = contact, собеседник = client
-    if source == "business":
-        # В business_message from_user — это собеседник (клиент)
-        # Если sender_business_bot — это сам владелец, пропускаем
-        if msg.sender_business_bot:
-            return None
+    is_owner_msg = bool(msg.sender_business_bot)
 
     tg_id = str(user.id)
     username = user.username
     name = f"{user.first_name or ''} {user.last_name or ''}".strip() or f"User {tg_id}"
+
+    # Для сообщений владельца — добавляем метку
+    if is_owner_msg:
+        name = f"{name} (владелец)"
 
     # Ищем по tg_username или по tg_id (в notes)
     existing = None

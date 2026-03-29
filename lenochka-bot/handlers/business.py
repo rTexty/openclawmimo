@@ -39,13 +39,14 @@ async def on_business_connection(bc: BusinessConnection, **kwargs):
 async def on_business_message(message: Message, pipeline, **kwargs):
     """
     Главный обработчик: бизнес-сообщение → ingest pipeline.
-    Антипетля: игнорируем sender_business_bot и is_from_offline.
+    
+    ВСЕ сообщения сохраняются — включая свои (sender_business_bot)
+    и автоответы (is_from_offline). CRM должна знать всё.
+    
+    Антипетля работает только на УРОВНЕ ОТВЕТА (should_respond),
+    а НЕ на уровне записи. Не сейчас — но логика такая:
+    если message.sender_business_bot → НЕ генерируем ответ.
     """
-    if message.sender_business_bot:
-        return
-    if message.is_from_offline:
-        return
-
     await pipeline.enqueue(
         message=message,
         source="business",
@@ -55,9 +56,7 @@ async def on_business_message(message: Message, pipeline, **kwargs):
 
 @router.edited_business_message()
 async def on_business_edited(message: Message, pipeline, **kwargs):
-    """Отредактированное → supersede."""
-    if message.sender_business_bot:
-        return
+    """Отредактированное → supersede. Все сообщения, включая свои."""
     await pipeline.enqueue(
         message=message,
         source="business_edited",
