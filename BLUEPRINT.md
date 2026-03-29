@@ -1,7 +1,7 @@
 # Lenochka Blueprint — Полная карта проекта
 
 > Документ создан 2026-03-29. Описывает всё: что есть, что сломается, к чему стремиться.
-> **Последнее обновление: 2026-03-30 01:04 GMT+8** — architecture fixes, webhook, supersede, batch classify.
+> **Последнее обновление: 2026-03-30 02:59 GMT+8** — 6 critical fixes, entity expansion, sqlite-vec + sentence-transformers.
 
 ## СТАТУС РЕАЛИЗАЦИИ (актуально)
 
@@ -10,19 +10,25 @@
 | CRM-БД (SQLite) | ✅ Готова | `lenochka-memory/schemas/init.sql` (15 таблиц + business_connections) |
 | Agent Memory | ✅ Работает | `lenochka-memory/mem.py` + `brain.py` |
 | CHAOS Search | ✅ Работает | `lenochka-memory/mem.py` |
-| Telegram-бот | ✅ Реализован (15 файлов) | `lenochka-bot/` |
+| Telegram-бот | ✅ Реализован (16 файлов) | `lenochka-bot/` |
 | Normalize Layer | ✅ Все типы сообщений | `lenochka-bot/services/normalizer.py` |
 | CRM Upsert | ✅ contacts/deals/leads/tasks | `lenochka-bot/services/crm_upsert.py` |
 | Brain Wrapper (daemon) | ✅ Модель один раз | `lenochka-bot/services/brain_wrapper.py` |
-| Pipeline (async queue) | ✅ Batch classify + batch embed + supersede | `lenochka-bot/services/pipeline.py` |
+| Pipeline (async queue) | ✅ Batch classify + batch embed + supersede + entity-enriched extract | `lenochka-bot/services/pipeline.py` |
 | Scheduler | ✅ Digest/weekly/consolidate | `lenochka-bot/services/scheduler.py` |
 | Webhook mode | ✅ Polling + webhook (aiohttp) | `lenochka-bot/__main__.py` |
-| Supersede (edited) | ✅ source_msg_id lookup + text update | `lenochka-bot/services/memory.py` |
+| Supersede (edited) | ✅ source_msg_id lookup + cascade to memories/chaos | `lenochka-bot/services/memory.py` |
 | Soft-delete | ✅ source_msg_id lookup | `lenochka-bot/services/memory.py` |
 | Business connections | ✅ DB table + CRUD | `lenochka-bot/services/memory.py` |
 | Batch classify | ✅ N messages → 1 LLM call | `lenochka-memory/brain.py` (`classify_batch`) |
 | Consolidate vec ANN | ✅ O(n·k) вместо O(n²) | `lenochka-memory/mem.py` |
 | Архитектура | ✅ Задокументирована | `ARCHITECTURE-TELEGRAM-BOT.md` |
+| Owner auth | ✅ OwnerMiddleware + is_owner checks | `lenochka-bot/middlewares/owner.py` |
+| LLM config | ✅ Единый префикс LEN_LLM_* | `brain.py` + `config.py` |
+| Transactional store | ✅ try/rollback для store + chaos_store | `lenochka-memory/mem.py` |
+| sqlite-vec | ✅ Установлен, работает | v0.1.7 |
+| sentence-transformers | ✅ Установлен, работает | v5.3.0, all-MiniLM-L6-v2, 384-dim |
+| Entity expansion | ✅ FK-traversal chain в recall + context_packet + /find + pipeline | `mem.py` + `brain.py` |
 | Response Engine | ❌ Не реализован | Phase 3 |
 | Voice Transcription | ❌ Не реализован | Phase 4 |
 | OCR | ❌ Не реализован | Phase 4 |
@@ -141,17 +147,23 @@ openclawmimo/
 - ✅ `consolidate` — decay + merge + cluster + RAPTOR
 - ✅ Fallback-ы — всё работает без LLM и без sentence-transformers
 
-### Что НЕ существует
+### Что НЕ существует (остаётся)
 
-- ❌ Telegram-connector (приём сообщений)
-- ❌ Normalize layer (извлечение текста из любого типа)
-- ❌ CRM upsert (создание contacts/deals/tasks из extracted entities)
-- ❌ Response engine (когда и как отвечать)
-- ❌ Daemon mode (long-running процесс)
-- ❌ Multi-user изоляция
+- ❌ Response engine (когда и как отвечать) — Phase 3
+- ❌ Multi-user изоляция — Phase 4
 - ❌ Миграции схемы БД
 - ❌ Тесты
-- ❌ Logging framework
+- ❌ Voice transcription, OCR — Phase 4
+
+### Что РЕАЛИЗОВАНО (но не существовало на момент написания)
+
+- ✅ Telegram-connector (приём сообщений) → `lenochka-bot/handlers/business.py`
+- ✅ Normalize layer → `lenochka-bot/services/normalizer.py`
+- ✅ CRM upsert → `lenochka-bot/services/crm_upsert.py`
+- ✅ Daemon mode → `lenochka-bot/services/brain_wrapper.py`
+- ✅ Logging framework → `lenochka-bot/middlewares/logging.py`
+- ✅ Owner auth → `lenochka-bot/middlewares/owner.py`
+- ✅ Entity expansion → `lenochka-memory/mem.py` (_expand_entity_context)
 
 ---
 
@@ -1021,8 +1033,72 @@ def test_consolidate_doesnt_corrupt_vectors():
 
 **Общий срок: ~9 недель.**
 
-**Самое острое непродуманное место сегодня:** между ingest и CRM-таблицами — пустота. Вся архитектура с 14 таблицами CRM существует в вакууме. Пока нет моста extract → CRM upsert, Lenochka = дорогой блокнот с векторным поиском.
+**Самое острое непродуманное место сегодня:** Response engine — Lenochka молча обрабатывает, но не отвечает пользователям. CRM-upsert мост уже реализован (crm_upsert.py), но нет генерации ответов.
 
-**Самый опасный баг сегодня:** concurrent access. Если два ingest() работают одновременно — SQLite locked → потеря сообщения или коррупция данных.
+**Самый опасный баг сегодня:** concurrent access. Если два ingest() работают одновременно — SQLite locked → потеря сообщения. WAL помогает читать, но writer contention остаётся.
 
-**Самый дорогой недочёт сегодня:** дедуп не покрывает noise. 500 сообщений/день × 10% noise = 50 бесполезных LLM-вызовов × 2 = 100 лишних API-вызовов ежедневно.
+**Самый дорогой недочёт сегодня:** pipeline queue не персистентен — рестарт бота = потеря in-flight сообщений из очереди.
+
+---
+
+## 7. ОБНОВЛЕНИЯ (сессия 2026-03-30 02:16 — 02:59)
+
+### Что сделано
+
+1. **6 критических фиксов** (коммит 54aac7e):
+   - LLM config unified: `brain.py` + `config.py` читают `LEN_LLM_*` (единый префикс)
+   - `store()` и `chaos_store()` — транзакционные (try/rollback)
+   - `OwnerMiddleware` — проверяет владение, инжектирует `is_owner`
+   - Direct messages НЕ пишут в CRM pipeline
+   - Supersede cascade — обновляет memories + chaos при edited messages
+   - Установлены sqlite-vec 0.1.7 + sentence-transformers 5.3.0
+
+2. **Анализ графового RAG:**
+   - Проведён глубокий анализ: нужен ли graph RAG для масштаба Lenochka
+   - Вывод: НЕ нужен. ~15K memories/год = крошечный масштаб
+   - vec ANN + FTS5 + FK-кластеризация уже покрывают основные сценарии
+   - Graph RAG (NetworkX, Neo4j) = overkill: +500 строк, +dependency, diminishing returns
+   - Замена: entity-aware context expansion (FK traversal) — 80% пользы при 5% сложности
+
+3. **Entity-aware context expansion** (коммиты c81a2f4, 54ec112):
+   - `_expand_entity_context()` — traversal по реальным FK-связям:
+     ```
+     memory → contact (кто клиент) → deal (сумма, стадия) → tasks (что делать)
+     contact/deal → другие memories (история) → chat_thread → сообщения (контекст)
+     ```
+   - Интегрировано в 4 точки:
+     - `recall()` — добавляет `_expansion` в результаты
+     - `build_context_packet()` — contacts/deals как facts, tasks/history как notes
+     - `/find` command — показывает блок «Связанный контекст» (кто, что, задачи, история)
+     - `pipeline._finalize_item()` — LLM при extract_entities получает enriched context
+
+### Что изменилось в архитектуре
+
+```
+ДО (сессия 01:04):
+  message → normalize → classify → extract(plain text) → store → CRM upsert
+
+ПОСЛЕ (сессия 02:59):
+  message → normalize → classify → extract(+entity context: existing contact/deals/tasks)
+            → store (transactional) → CRM upsert
+            → supersede (cascade: messages + memories + chaos)
+            → /find shows entity chain (contact → deal → tasks → history → chat)
+```
+
+### Влияние на план (4 этапа)
+
+| Что | Было в плане | Статус сейчас |
+|-----|-------------|---------------|
+| Phase 1: Telegram-connector | Не было кода | ✅ Реализован |
+| Phase 1: Normalize layer | Не было кода | ✅ Реализован |
+| Phase 1: CRM upsert | Не было кода | ✅ Реализован |
+| Phase 1: Supersede | Не было кода | ✅ Реализован + cascade |
+| Phase 1: Emoji classifier | Не было кода | ✅ Реализован (normalizer.py) |
+| Phase 2: Context window classify | Не было | ✅ Реализован (pipeline._get_chat_context) |
+| Phase 2: Consolidate vec ANN | Не было | ✅ Реализован |
+| Phase 2: Deal linking | Не было | ⚠️ Частично (entity expansion показывает deal, но нет auto-linking) |
+| Phase 2: Entity expansion | Не было | ✅ Реализован (NEW — не было в плане) |
+| Phase 3: Daemon mode | Не было | ✅ Реализован (brain_wrapper) |
+| Phase 3: Response engine | Не было | ❌ Не реализован |
+| Phase 3: Digest delivery | Не было | ⚠️ Генерация есть, отправки в Telegram нет |
+| Phase 3: Logging | Не было | ✅ Реализован |

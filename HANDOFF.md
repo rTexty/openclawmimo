@@ -430,3 +430,91 @@ c052d76 Phase 1 fixes (7 items):
 8d5ea28 Lenochka Memory v2 — initial implementation
 ```
 
+
+
+# SESSION HANDOFF — Lenochka Project
+# Сессия 2026-03-30 02:16 — 02:59 GMT+8
+# Камиль + Леночка
+
+## Что произошло
+
+### Предыдущие сессии (из старого HANDOFF)
+- Сессия 2026-03-29 16:21—17:08: созданы mem.py v2, brain.py v2, схема SQL, проведён аудит
+- Сессия 2026-03-29 23:02—00:00: реализован Telegram-бот (14 файлов), архитектура, pipeline
+- Сессия 2026-03-30 00:14—01:04: 11 фиксов (schema, batch classify, consolidate vec ANN, webhook, supersede, source_msg_id)
+
+### Эта сессия (2026-03-30 02:16 — 02:59)
+
+1. **Перенос в OpenClaw workspace:** Удалены текущие файлы, склонирован https://github.com/rTexty/openclawmimo.git
+   - PAT настроен в git remote для push
+   - Регулярные коммиты и пуши
+
+2. **Погружение в контекст:** Изучены ВСЕ файлы проекта:
+   - HANDOFF.md (история 3 сессий)
+   - BLUEPRINT.md (полный user flow, 28 уязвимостей, 4 этапа)
+   - ARCHITECTURE-TELEGRAM-BOT.md (1644 строк, полный дизайн)
+   - lenochka-context/*.md (3 файла контекста)
+   - lenochka-memory/ (mem.py 1068 строк, brain.py 941 строк, init.sql, AUDIT.md)
+   - lenochka-bot/ (все 14+ файлов)
+
+3. **Фикс 6 критических проблем (1 коммит: 54aac7e):**
+   - LLM config unified: brain.py читает `LEN_LLM_*` (как config.py) с fallback на `LENOCHKA_LLM_*`
+   - store() transactional: try/except/rollback — memory + vector atomically или не пишутся
+   - chaos_store() transactional: тот же fix
+   - OwnerMiddleware: проверяет from_user.id == settings.owner_id, инжектирует is_owner
+   - All commands + direct_message проверяют is_owner
+   - Direct messages НЕ пишут в CRM pipeline (owner → подсказка, non-owner → приветствие)
+   - Supersede cascade: обновляет memories.content + content_hash + chaos_entries.content при edited messages
+   - Установлены sqlite-vec 0.1.7 + sentence-transformers 5.3.0 (real 384-dim embeddings)
+
+4. **Анализ графового RAG:** Проведён глубокий анализ нужности graph RAG:
+   - Вывод: НЕ нужен полноценный (NetworkX, Neo4j, community detection)
+   - Причина: масштаб ~15K memories/год — крошечный, vec + FTS + FK справляются
+   - Рекомендация: entity-aware context expansion (FK traversal) > graph RAG
+
+5. **Entity-aware context expansion (2 коммита: c81a2f4, 54ec112):**
+   - `_expand_entity_context()` в mem.py — traversal по FK-связям:
+     - memory → contact (имя, @username, компания)
+     - memory → deal (сумма, стадия, сроки)
+     - deal/contact → tasks (что сделать, приоритет, сроки)
+     - contact/deal → другие memories (история общения)
+     - chat_thread → последние сообщения (живой контекст)
+   - Интегрировано в 4 точки:
+     - `recall()` — расширяет результаты
+     - `build_context_packet()` — шаг 6: contacts/deals как facts, tasks/history как notes
+     - `/find` command — показывает блок «Связанный контекст»
+     - `pipeline._finalize_item()` — LLM при extract_entities получает enriched context
+
+## Структура файлов (изменения в этой сессии)
+
+```
+НОВЫЙ ФАЙЛ:
+  lenochka-bot/middlewares/owner.py      # OwnerMiddleware
+
+ИЗМЕНЁННЫЕ:
+  lenochka-memory/mem.py                 # +entity expansion, +transactional store/chaos_store
+  lenochka-memory/brain.py               # +entity expansion в context_packet, unified LLM config
+  lenochka-bot/handlers/commands.py      # +is_owner checks, /find с entity expansion
+  lenochka-bot/services/memory.py        # +format_expansion_for_tg, _esc
+  lenochka-bot/services/pipeline.py      # +_enrich_extract_context для extract_entities
+  lenochka-bot/middlewares/__init__.py   # +OwnerMiddleware в setup
+  .gitignore                             # +.openclaw/
+```
+
+## Ключевые решения (эта сессия)
+
+1. **LLM config: LEN_LLM_* единый префикс** — brain.py и config.py читают одни env vars
+2. **store() try/rollback** — vector fail = memory тоже откатывается
+3. **OwnerMiddleware как отдельный middleware** — не в каждом handler свой if-check
+4. **Direct messages НЕ в pipeline** — /status, /help и сообщения в личку НЕ засоряют CRM
+5. **Supersede cascade** — edited message обновляет messages + memories + chaos_entries
+6. **Entity expansion вместо graph RAG** — FK traversal даёт 80% ценности при 5% сложности
+7. **Entity context в pipeline** — LLM при extract_entities видит существующие contact/deal/task
+
+## Git log (новые коммиты этой сессии)
+
+```
+54ec112 Integrate entity expansion everywhere: /find, pipeline enrich extract_entities
+c81a2f4 Add entity-aware context expansion: FK-traversal chain
+54aac7e Fix 6 critical issues: LLM config, store() tx, owner MW, supersede cascade, install deps
+```
