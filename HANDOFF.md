@@ -696,8 +696,21 @@ c81a2f4 Add entity-aware context expansion: FK-traversal chain
 9. **No anti-loop needed** — бот никогда не пишет в бизнес-чат. Пишет только owner'у в личку.
 10. **4 phases, ~10 часов** — fact response (3ч) + escalation (3ч) + proactive (2ч) + polish (2ч)
 
+### Итерация v3 (LLM-in-the-loop)
+
+Камиль указал: regex не покрывает реальную речь. Нужен LLM.
+
+1. **LLM для понимания вопроса** — Step 1: decide_response() определяет intent и action
+2. **SQL для фактов** — Step 2: query_fact() достаёт данные из БД (бесплатно)
+3. **LLM для формулировки** — Step 3: generate_fact_response() формирует естественный ответ
+4. **Combined classify+route** — один LLM-вызов вместо двух (classify + response decision)
+5. **Fast path** — "ок/согласен" → skip без LLM (бесплатно)
+6. **Cost: $15-33/мес** — с оптимизациями (combined prompt, fast path, batch)
+
 ## Git log
 
 ```
+e381bf5 Response Engine v3: LLM-in-the-loop architecture
+a5998c9 Handoff: add session 2026-03-30 04:07-04:35, response engine architecture decisions
 406bb4c Response Engine architecture: fact-based responses, escalation, proactive reminders
 ```
