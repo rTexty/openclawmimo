@@ -2,11 +2,13 @@
 from aiogram import Dispatcher
 from middlewares.throttling import ThrottlingMiddleware
 from middlewares.logging import LoggingMiddleware
+from middlewares.owner import OwnerMiddleware
 from config import settings
 
 
 def setup_middlewares(dp: Dispatcher, brain):
-    """Регистрация middleware. Порядок: Logging → Throttling."""
+    """Регистрация middleware. Порядок: Owner → Logging → Throttling."""
+    dp.message.middleware(OwnerMiddleware())
     dp.message.middleware(LoggingMiddleware())
     dp.message.middleware(ThrottlingMiddleware(rate_limit=settings.rate_limit_messages))
 

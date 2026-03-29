@@ -84,12 +84,9 @@ def supersede_message(chat_thread_id: int, source_msg_id: int,
     Supersede: обновить существующее сообщение при редактировании.
     
     Ищем message по (chat_thread_id, source_msg_id):
-      - Найдена → UPDATE text, сброс classification/analyzed для повторной обработки
+      - Найдена → UPDATE text, сброс classification/analyzed
+      - Cascade: обновляем memories и chaos_entries по source_message_id
       - Не найдена → возвращаем None, pipeline создаёт как новое
-    
-    Архитектурное решение: обновляем ТОЛЬКО messages.text и сбрасываем флаги.
-    memories и chaos_entries НЕ трогаем — они хранят уже классифицированный контент.
-    Переклассификация через nightly consolidate или ручную /reclassify.
     """
     conn = get_db(db_path)
     try:
@@ -103,7 +100,9 @@ def supersede_message(chat_thread_id: int, source_msg_id: int,
             return None
 
         msg_id = row["id"]
+        old_text = row["text"]
 
+        # 1. Обновляем messages.text + сбрасываем флаги для повторной обработки
         conn.execute(
             """UPDATE messages
                SET text = ?, classification = NULL, analyzed = 0,
@@ -113,10 +112,40 @@ def supersede_message(chat_thread_id: int, source_msg_id: int,
                        '$.prev_text', ?
                    )
                WHERE id = ?""",
-            (new_text, row["text"], msg_id),
+            (new_text, old_text, msg_id),
         )
+
+        # 2. Cascade: обновляем memories по source_message_id
+        # Пересчитываем content с новым текстом, обновляем content_hash
+        new_hash = content_hash(new_text)
+        conn.execute(
+            """UPDATE memories
+               SET content = CASE
+                   WHEN content LIKE '[%] %' THEN
+                       substr(content, 1, instr(content, '] ') + 1) || ?
+                   ELSE ?
+                   END,
+                   content_hash = ?
+               WHERE source_message_id = ?""",
+            (new_text[:200], new_text[:200], new_hash, msg_id),
+        )
+
+        # 3. Cascade: обновляем chaos_entries по memory_id → source_message_id
+        memory_ids = conn.execute(
+            "SELECT id FROM memories WHERE source_message_id = ?",
+            (msg_id,),
+        ).fetchall()
+        for mrow in memory_ids:
+            conn.execute(
+                "UPDATE chaos_entries SET content = ? WHERE memory_id = ?",
+                (new_text[:200], mrow["id"]),
+            )
+
         conn.commit()
-        logger.info(f"Supersede: msg#{msg_id} edited (source_msg_id={source_msg_id})")
+        logger.info(
+            f"Supersede: msg#{msg_id} edited (source_msg_id={source_msg_id}), "
+            f"cascaded to memories + chaos"
+        )
         return msg_id
     finally:
         conn.close()

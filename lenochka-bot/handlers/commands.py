@@ -1,5 +1,8 @@
 """
 Command Handlers — /start, /status, /leads, /tasks, /digest, /weekly, /find, /help
+
+Все команды защищены is_owner (инжектируется OwnerMiddleware).
+Non-owner получает приветствие и блокировку.
 """
 import logging
 from aiogram import Router, F
@@ -14,8 +17,19 @@ router = Router(name="commands")
 logger = logging.getLogger("lenochka.commands")
 
 
+async def _check_owner(message: Message, is_owner: bool) -> bool:
+    """Проверить владение. Возвращает True если можно продолжать."""
+    if is_owner:
+        return True
+    await message.answer("👋 Привет! Я Lenochka — AI-ассистент. Пока я работаю только для своего владельца.")
+    return False
+
+
 @router.message(Command("start"))
-async def cmd_start(message: Message, **kwargs):
+async def cmd_start(message: Message, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     status = mem.get_business_status(message.from_user.id, settings.db_path)
 
     text = (
@@ -37,7 +51,10 @@ async def cmd_start(message: Message, **kwargs):
 
 
 @router.message(Command("status"))
-async def cmd_status(message: Message, brain, **kwargs):
+async def cmd_status(message: Message, brain, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     s = mem.get_status_summary(settings.db_path)
     text = (
         f"📊 <b>Статус</b>\n\n"
@@ -52,7 +69,10 @@ async def cmd_status(message: Message, brain, **kwargs):
 
 
 @router.message(Command("leads"))
-async def cmd_leads(message: Message, **kwargs):
+async def cmd_leads(message: Message, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     leads = mem.get_active_leads(settings.db_path)
     if not leads:
         await message.answer("🔥 Нет активных лидов.")
@@ -70,7 +90,10 @@ async def cmd_leads(message: Message, **kwargs):
 
 
 @router.message(Command("tasks"))
-async def cmd_tasks(message: Message, **kwargs):
+async def cmd_tasks(message: Message, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     tasks = mem.get_open_tasks(settings.db_path)
     if not tasks:
         await message.answer("📋 Нет открытых задач.")
@@ -89,7 +112,10 @@ async def cmd_tasks(message: Message, **kwargs):
 
 
 @router.message(Command("digest"))
-async def cmd_digest(message: Message, brain, **kwargs):
+async def cmd_digest(message: Message, brain, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     if brain.is_ready():
         text = brain.daily_digest()
     else:
@@ -98,7 +124,10 @@ async def cmd_digest(message: Message, brain, **kwargs):
 
 
 @router.message(Command("weekly"))
-async def cmd_weekly(message: Message, brain, **kwargs):
+async def cmd_weekly(message: Message, brain, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     if brain.is_ready():
         text = brain.weekly_digest()
     else:
@@ -107,7 +136,10 @@ async def cmd_weekly(message: Message, brain, **kwargs):
 
 
 @router.message(Command("find"))
-async def cmd_find(message: Message, brain, **kwargs):
+async def cmd_find(message: Message, brain, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Использование: /find <запрос>")
@@ -129,7 +161,10 @@ async def cmd_find(message: Message, brain, **kwargs):
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message, **kwargs):
+async def cmd_help(message: Message, is_owner: bool = False, **kwargs):
+    if not await _check_owner(message, is_owner):
+        return
+
     text = (
         "🤖 <b>Lenochka — команды</b>\n\n"
         "/status — статус CRM\n"
@@ -147,17 +182,24 @@ async def cmd_help(message: Message, **kwargs):
 
 # Direct non-command messages — ingest too
 @router.message(F.chat.type == "private")
-async def on_direct_message(message: Message, pipeline, is_owner: bool = True, **kwargs):
+async def on_direct_message(message: Message, pipeline, is_owner: bool = False, **kwargs):
     """
     Прямые сообщения боту (не команды).
-    Если owner — ingest в pipeline. Если нет — приветствие.
+    
+    Если owner — НЕ пишем в CRM pipeline (это не переписка с клиентом,
+    а управление ботом). Вместо этого — подсказка или обработка в будущем
+    (response engine).
+    
+    Если не owner — приветствие.
     """
     if not is_owner:
         await message.answer("👋 Привет! Я Lenochka — AI-ассистент. Пока я работаю только для своего владельца.")
         return
 
-    # Owner написал не-команду — ingest как business message
-    await pipeline.enqueue(
-        message=message,
-        source="direct",
+    # Owner написал не-команду в личку боту
+    # НЕ ingest в pipeline — это засоряет CRM данными, которые не являются перепиской с клиентом
+    # В будущем здесь будет response engine (LLM-ответ от имени бота)
+    await message.answer(
+        "💡 Пиши команды: /status, /leads, /tasks, /digest, /find <запрос>\n"
+        "Или просто живи в Telegram — я анализирую переписки автоматически."
     )

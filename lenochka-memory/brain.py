@@ -20,10 +20,11 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent / "db" / "lenochka.db"
 EMBEDDING_DIM = 384  # all-MiniLM-L6-v2
 
-# LLM config (OpenAI-совместимый API)
-LLM_BASE_URL = os.environ.get("LENOCHKA_LLM_BASE_URL", "")
-LLM_API_KEY = os.environ.get("LENOCHKA_LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LENOCHKA_LLM_MODEL", "mimo-v2-pro")
+# LLM config — читаем LEN_LLM_* (единый префикс с config.py)
+# Fallback на LENOCHKA_LLM_* для обратной совместимости
+LLM_BASE_URL = os.environ.get("LEN_LLM_BASE_URL", os.environ.get("LENOCHKA_LLM_BASE_URL", ""))
+LLM_API_KEY = os.environ.get("LEN_LLM_API_KEY", os.environ.get("LENOCHKA_LLM_API_KEY", ""))
+LLM_MODEL = os.environ.get("LEN_LLM_MODEL", os.environ.get("LENOCHKA_LLM_MODEL", "mimo-v2-pro"))
 
 
 # =========================================================
