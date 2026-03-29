@@ -1,6 +1,26 @@
 # Lenochka Blueprint — Полная карта проекта
 
 > Документ создан 2026-03-29. Описывает всё: что есть, что сломается, к чему стремиться.
+> **Последнее обновление: 2026-03-29 23:56 GMT+8** — реализован Telegram-бот.
+
+## СТАТУС РЕАЛИЗАЦИИ (актуально)
+
+| Компонент | Статус | Файлы |
+|-----------|--------|-------|
+| CRM-БД (SQLite) | ✅ Готова | `lenochka-memory/schemas/init.sql` |
+| Agent Memory | ✅ Работает | `lenochka-memory/mem.py` + `brain.py` |
+| CHAOS Search | ✅ Работает | `lenochka-memory/mem.py` |
+| Telegram-бот | ✅ Реализован (14 файлов) | `lenochka-bot/` |
+| Normalize Layer | ✅ Все типы сообщений | `lenochka-bot/services/normalizer.py` |
+| CRM Upsert | ✅ contacts/deals/leads/tasks | `lenochka-bot/services/crm_upsert.py` |
+| Brain Wrapper (daemon) | ✅ Модель один раз | `lenochka-bot/services/brain_wrapper.py` |
+| Pipeline (async queue) | ✅ Batching + dedup | `lenochka-bot/services/pipeline.py` |
+| Scheduler | ✅ Digest/weekly/consolidate | `lenochka-bot/services/scheduler.py` |
+| Архитектура | ✅ Задокументирована | `ARCHITECTURE-TELEGRAM-BOT.md` |
+| Response Engine | ❌ Не реализован | Phase 3 |
+| Voice Transcription | ❌ Не реализован | Phase 4 |
+| OCR | ❌ Не реализован | Phase 4 |
+| Multi-user | ❌ Не реализован | Phase 4 |
 
 ---
 
