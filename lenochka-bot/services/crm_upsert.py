@@ -48,10 +48,11 @@ def crm_upsert(entities: dict, contact_id: int | None,
 
 def _upsert_entity_contact(conn: sqlite3.Connection, c: dict,
                             message_id: int) -> int | None:
-    """Contact entity → contacts table."""
+    """Contact entity → contacts table. Ищем существующий перед созданием."""
     tg = c.get("tg_username")
     name = c.get("name") or "Unknown"
 
+    # 1. Поиск по tg_username
     if tg:
         existing = conn.execute(
             "SELECT id FROM contacts WHERE tg_username = ?", (tg,)
@@ -63,6 +64,21 @@ def _upsert_entity_contact(conn: sqlite3.Connection, c: dict,
             )
             return existing["id"]
 
+    # 2. Поиск по имени (если имя уникальное — лучше чем дубль)
+    if name and name != "Unknown":
+        existing = conn.execute(
+            "SELECT id FROM contacts WHERE name = ? AND tg_username IS NULL",
+            (name,),
+        ).fetchone()
+        if existing:
+            if tg:
+                conn.execute(
+                    "UPDATE contacts SET tg_username = ?, updated_at = datetime('now') WHERE id = ?",
+                    (tg, existing["id"]),
+                )
+            return existing["id"]
+
+    # 3. Создаём нового
     conn.execute(
         "INSERT INTO contacts (name, tg_username, notes) VALUES (?, ?, ?)",
         (name, tg, f"auto-created msg#{message_id}"),
@@ -75,7 +91,9 @@ def _upsert_entity_contact(conn: sqlite3.Connection, c: dict,
 def _upsert_deal(conn: sqlite3.Connection, amounts: list,
                   contact_id: int, message_id: int):
     """Amounts → deal (create or update)."""
-    amount = max(amounts)  # Берём максимальную
+    # Last amount (не max!) — «Было 150, стало 120» → 120 актуальна
+    # Max ломает на скидках, дельтах, процентах
+    amount = amounts[-1] if amounts else 0
 
     existing = conn.execute(
         """SELECT id, amount FROM deals

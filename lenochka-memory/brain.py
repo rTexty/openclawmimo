@@ -13,8 +13,14 @@ import os
 import sys
 import sqlite3
 import struct
-from datetime import datetime, timedelta
+import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    requests = None  # graceful degradation — _call_llm returns None
 
 # === Конфигурация ===
 DB_PATH = Path(__file__).parent / "db" / "lenochka.db"
@@ -85,10 +91,10 @@ def _embed_fallback(text):
         grams[g] = grams.get(g, 0) + 1
     if not grams:
         return [0.0] * EMBEDDING_DIM
-    # Hash-проекция в EMBEDDING_DIM
+    # Deterministic hash-проекция в EMBEDDING_DIM (SHA-256, не Python hash())
     vec = [0.0] * EMBEDDING_DIM
     for gram, count in grams.items():
-        h = hash(gram) % EMBEDDING_DIM
+        h = int(hashlib.sha256(gram.encode('utf-8')).hexdigest()[:8], 16) % EMBEDDING_DIM
         vec[h] += count
     # Нормализация
     norm = sum(v * v for v in vec) ** 0.5
@@ -131,17 +137,57 @@ def similarity(text1, text2):
 # 2. LLM ИНТЕГРАЦИЯ
 # =========================================================
 
+def _extract_json(text):
+    """
+    Извлечь JSON из текста LLM-ответа.
+    Ищет первый { ... } или [ ... ] с учётом вложенности и строковых литералов.
+    Возвращает parsed object или None.
+    """
+    text = text.strip()
+    # Ищем начало JSON
+    for i, ch in enumerate(text):
+        if ch not in '{[':
+            continue
+        close_ch = '}' if ch == '{' else ']'
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        while j < len(text):
+            c = text[j]
+            if escape:
+                escape = False
+                j += 1
+                continue
+            if c == '\\' and in_string:
+                escape = True
+                j += 1
+                continue
+            if c == '"' and not escape:
+                in_string = not in_string
+            elif not in_string:
+                if c == ch:
+                    depth += 1
+                elif c == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[i:j+1])
+                        except json.JSONDecodeError:
+                            break
+            j += 1
+    return None
+
 def _call_llm(system_prompt, user_prompt, temperature=0.0, max_tokens=2048):
     """Вызов LLM через OpenAI-совместимый API с retry/backoff."""
     import time
 
-    if not LLM_BASE_URL or not LLM_API_KEY:
+    if not LLM_BASE_URL or not LLM_API_KEY or requests is None:
         return None
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            import requests
             url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
             headers = {
                 "Content-Type": "application/json",
@@ -196,15 +242,14 @@ def classify_message(text, chat_context=None):
 
     if result:
         try:
-            json_match = re.search(r'\{[^}]+\}', result, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
+            data = _extract_json(result)
+            if isinstance(data, dict):
                 return (
                     data.get("label", "other"),
                     data.get("confidence", 0.5),
                     data.get("reasoning", ""),
                 )
-        except (json.JSONDecodeError, KeyError):
+        except Exception:
             pass
 
     return _classify_heuristic(text)
@@ -257,19 +302,23 @@ def classify_batch(texts: list[str], chat_contexts: list[str] | None = None):
 
     if result:
         try:
-            json_match = re.search(r'\[.*\]', result, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                if isinstance(data, list) and len(data) == len(texts):
-                    return [
-                        (
-                            item.get("label", "other"),
-                            item.get("confidence", 0.5),
-                            item.get("reasoning", "batch"),
-                        )
-                        for item in data
-                    ]
-        except (json.JSONDecodeError, KeyError, TypeError):
+            data = _extract_json(result)
+            if isinstance(data, list):
+                parsed = [
+                    (
+                        item.get("label", "other"),
+                        item.get("confidence", 0.5),
+                        item.get("reasoning", "batch"),
+                    )
+                    for item in data
+                ]
+                if len(parsed) == len(texts):
+                    return parsed
+                # Partial: LLM вернул меньше элементов — используем что есть, остальные heuristic
+                if 0 < len(parsed) < len(texts):
+                    parsed += [_classify_heuristic(t) for t in texts[len(parsed):]]
+                    return parsed
+        except Exception:
             pass
 
     # Fallback: heuristic поштучно
@@ -345,10 +394,10 @@ def extract_entities(text, label=None, chat_context=None):
 
     if result:
         try:
-            json_match = re.search(r'\{[^}]+\}', result, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, KeyError):
+            data = _extract_json(result)
+            if isinstance(data, dict):
+                return data
+        except Exception:
             pass
 
     return _extract_heuristic(text)
@@ -995,10 +1044,18 @@ def build_context_packet(query, contact_id=None, deal_id=None,
 # 8. ДАЙДЖЕСТЫ
 # =========================================================
 
+GMT8 = timezone(timedelta(hours=8))
+
+
+def _now_gmt8():
+    """Текущее время в GMT+8 (Камиль)."""
+    return datetime.now(GMT8)
+
+
 def generate_daily_digest(date=None):
     """Сгенерировать утренний дайджест."""
     if date is None:
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = _now_gmt8().strftime("%Y-%m-%d")
 
     conn = _get_db()
     start = f"{date} 00:00:00"
@@ -1057,7 +1114,7 @@ def generate_daily_digest(date=None):
 
 def generate_weekly_digest(weeks_back=0):
     """Сгенерировать недельный дайджест."""
-    now = datetime.now()
+    now = _now_gmt8()
     end_date = now - timedelta(weeks=weeks_back)
     start_date = end_date - timedelta(days=7)
     start = start_date.strftime("%Y-%m-%d")

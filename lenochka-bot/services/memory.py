@@ -43,7 +43,17 @@ def dedup_check(msg: Message, normalized_text: str, db_path: str) -> str | None:
         if existing:
             return None
 
-        # 2. Content hash — защита от одинаковых текстов в разных чатах
+        # 2. Content hash в messages — покрывает ВСЕ сообщения (включая noise/chit-chat)
+        #    раньше проверял только memories → noise/chit-chat не попадали туда → дубли LLM-вызовов
+        existing = conn.execute(
+            """SELECT id FROM messages
+               WHERE content_hash = ? AND sent_at > datetime('now', '-1 day')""",
+            (ch,),
+        ).fetchone()
+        if existing:
+            return None
+
+        # 3. Content hash в memories — для бизнес-сообщений
         existing = conn.execute(
             """SELECT id FROM memories
                WHERE content_hash = ? AND created_at > datetime('now', '-1 day')""",
@@ -61,15 +71,17 @@ def store_message(chat_thread_id: int, from_user_id: str, text: str,
                   sent_at, content_type: str, meta: dict | None,
                   source_msg_id: int, content_hash_val: str,
                   db_path: str) -> int:
-    """Сохранить raw message в CRM messages table с source_msg_id."""
+    """Сохранить raw message в CRM messages table с source_msg_id и content_hash."""
     conn = get_db(db_path)
     try:
         conn.execute(
             """INSERT INTO messages (chat_thread_id, from_user_id, text, sent_at,
-                                     classification, analyzed, source_msg_id, meta_json)
-               VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, 0, ?, ?)""",
+                                     classification, analyzed, source_msg_id, meta_json,
+                                     content_hash)
+               VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, 0, ?, ?, ?)""",
             (chat_thread_id, from_user_id, text, sent_at,
-             None, source_msg_id, json.dumps(meta) if meta else None),
+             None, source_msg_id, json.dumps(meta) if meta else None,
+             content_hash_val),
         )
         mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
@@ -293,21 +305,22 @@ def get_status_summary(db_path: str) -> dict:
         conn.close()
 
 
-def get_active_leads(db_path: str) -> list[dict]:
+def get_active_leads(db_path: str, limit: int = 10) -> list[dict]:
     conn = get_db(db_path)
     try:
         rows = conn.execute(
             """SELECT l.*, c.name as contact_name FROM leads l
                JOIN contacts c ON l.contact_id = c.id
                WHERE l.status NOT IN ('won', 'lost')
-               ORDER BY l.created_at DESC LIMIT 10"""
+               ORDER BY l.created_at DESC LIMIT ?""",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_open_tasks(db_path: str) -> list[dict]:
+def get_open_tasks(db_path: str, limit: int = 10) -> list[dict]:
     conn = get_db(db_path)
     try:
         rows = conn.execute(
@@ -316,7 +329,8 @@ def get_open_tasks(db_path: str) -> list[dict]:
                ORDER BY
                  CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
                  due_at ASC
-               LIMIT 10"""
+               LIMIT ?""",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:

@@ -48,16 +48,16 @@ def _upsert_contact(conn: sqlite3.Connection, msg: Message,
     if is_owner_msg:
         name = f"{name} (владелец)"
 
-    # Ищем по tg_username или по tg_id (в notes)
+    # Ищем по tg_user_id, затем tg_username
     existing = None
-    if username:
+
+    existing = conn.execute(
+        "SELECT id FROM contacts WHERE tg_user_id = ?", (tg_id,)
+    ).fetchone()
+
+    if not existing and username:
         existing = conn.execute(
             "SELECT id FROM contacts WHERE tg_username = ?", (username,)
-        ).fetchone()
-
-    if not existing:
-        existing = conn.execute(
-            "SELECT id FROM contacts WHERE notes LIKE ?", (f"%tg_id:{tg_id}%",)
         ).fetchone()
 
     if existing:
@@ -70,9 +70,9 @@ def _upsert_contact(conn: sqlite3.Connection, msg: Message,
 
     # Create new
     conn.execute(
-        """INSERT INTO contacts (name, tg_username, notes)
-           VALUES (?, ?, ?)""",
-        (name, username, f"tg_id:{tg_id}"),
+        """INSERT INTO contacts (name, tg_username, tg_user_id, notes)
+           VALUES (?, ?, ?, ?)""",
+        (name, username, tg_id, f"tg_id:{tg_id}"),
     )
     cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     logger.info(f"New contact: #{cid} {name} (@{username})")

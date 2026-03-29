@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     tg_username TEXT UNIQUE,
+    tg_user_id TEXT UNIQUE,
     phones TEXT,          -- JSON array
     emails TEXT,          -- JSON array
     company_id INTEGER REFERENCES companies(id),
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS messages (
     classification TEXT CHECK(classification IN ('noise', 'chit-chat', 'business-small', 'task', 'decision', 'lead-signal', 'risk', 'other')),
     analyzed INTEGER DEFAULT 0,
     source_msg_id INTEGER,
+    content_hash TEXT,
     meta_json TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -54,6 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent ON messages(sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_class ON messages(classification);
 CREATE INDEX IF NOT EXISTS idx_messages_analyzed ON messages(analyzed);
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup ON messages(chat_thread_id, source_msg_id)
     WHERE source_msg_id IS NOT NULL;
 

@@ -58,26 +58,70 @@ def _load_vec(conn):
         return False
 
 
+# Current schema version — increment on every schema change
+SCHEMA_VERSION = 2
+
+
 def init():
     """Инициализация базы данных."""
-    if DB_PATH.exists():
-        print(f"БД уже существует: {DB_PATH}")
+    conn = get_db()
+
+    if not DB_PATH.exists():
+        # Новая БД — создаём полную схему
+        schema = SCHEMA_PATH.read_text()
+        conn.executescript(schema)
+
+        # Создать векторные таблицы через sqlite-vec
+        if _load_vec(conn):
+            conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{EMBEDDING_DIM}])")
+            conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chaos USING vec0(embedding float[{EMBEDDING_DIM}])")
+            print("✅ Векторные таблицы (sqlite-vec) созданы")
+        else:
+            print("⚠️ sqlite-vec недоступен — векторный поиск отключён")
+
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+        conn.close()
+        print(f"✅ БД создана: {DB_PATH}")
+    else:
+        # БД существует — проверяем миграции
+        _migrate_db(conn)
+        conn.close()
+
+
+def _migrate_db(conn):
+    """Миграции схемы по PRAGMA user_version."""
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    if current >= SCHEMA_VERSION:
+        print(f"✅ Схема актуальная (v{current})")
         return
 
-    conn = get_db()
-    schema = SCHEMA_PATH.read_text()
-    conn.executescript(schema)
+    print(f"🔄 Миграция: v{current} → v{SCHEMA_VERSION}")
 
-    # Создать векторные таблицы через sqlite-vec
-    if _load_vec(conn):
-        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{EMBEDDING_DIM}])")
-        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chaos USING vec0(embedding float[{EMBEDDING_DIM}])")
-        print("✅ Векторные таблицы (sqlite-vec) созданы")
-    else:
-        print("⚠️ sqlite-vec недоступен — векторный поиск отключён")
+    if current < 2:
+        # v2: content_hash в messages, tg_user_id в contacts
+        _migrate_v2(conn)
 
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
-    conn.close()
+    print(f"✅ Миграция завершена → v{SCHEMA_VERSION}")
+
+
+def _migrate_v2(conn):
+    """v1 → v2: content_hash + tg_user_id."""
+    # messages.content_hash
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "content_hash" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash)")
+        print("   + messages.content_hash")
+
+    # contacts.tg_user_id
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(contacts)").fetchall()]
+    if "tg_user_id" not in cols:
+        conn.execute("ALTER TABLE contacts ADD COLUMN tg_user_id TEXT UNIQUE")
+        print("   + contacts.tg_user_id")
     print(f"✅ БД создана: {DB_PATH}")
 
 
@@ -595,7 +639,7 @@ def chaos_store(content, category="other", priority=0.5,
 
 
 def chaos_search(query, mode="index", limit=10):
-    """Поиск в CHAOS."""
+    """Поиск в CHAOS (read-only — НЕ обновляет heat/access_count)."""
     conn = get_db()
     results = []
 
@@ -610,15 +654,7 @@ def chaos_search(query, mode="index", limit=10):
                 ORDER BY rank
                 LIMIT ?
             """, (query, limit)).fetchall()
-            for r in rows:
-                conn.execute("""
-                    UPDATE chaos_entries
-                    SET access_count = access_count + 1,
-                        last_accessed_at = datetime('now')
-                    WHERE id = ?
-                """, (r["id"],))
-                results.append(dict(r))
-            conn.commit()
+            results = [dict(r) for r in rows]
         except Exception as e:
             print(f"FTS error: {e}", file=sys.stderr)
 
@@ -631,15 +667,7 @@ def chaos_search(query, mode="index", limit=10):
                 ORDER BY heat_score DESC
                 LIMIT ?
             """, (f"%{query}%", f"%{query}%", limit)).fetchall()
-            for r in rows:
-                conn.execute("""
-                    UPDATE chaos_entries
-                    SET access_count = access_count + 1,
-                        last_accessed_at = datetime('now')
-                    WHERE id = ?
-                """, (r["id"],))
-                results.append(dict(r))
-            conn.commit()
+            results = [dict(r) for r in rows]
 
     elif mode == "full":
         rows = conn.execute("""
@@ -649,18 +677,22 @@ def chaos_search(query, mode="index", limit=10):
             ORDER BY heat_score DESC
             LIMIT ?
         """, (f"%{query}%", limit)).fetchall()
-        for r in rows:
-            conn.execute("""
-                UPDATE chaos_entries
-                SET access_count = access_count + 1,
-                    last_accessed_at = datetime('now')
-                WHERE id = ?
-            """, (r["id"],))
-            results.append(dict(r))
-        conn.commit()
+        results = [dict(r) for r in rows]
 
     conn.close()
     return results
+
+
+def chaos_touch(chaos_id: int):
+    """Обновить heat при явном доступе к CHAOS entry (не поиск, а использование)."""
+    conn = get_db()
+    conn.execute("""
+        UPDATE chaos_entries
+        SET access_count = access_count + 1, last_accessed_at = datetime('now')
+        WHERE id = ?
+    """, (chaos_id,))
+    conn.commit()
+    conn.close()
 
 
 def chaos_reindex():
@@ -1163,6 +1195,14 @@ def main():
 
     if cmd == "init":
         init()
+
+    elif cmd == "migrate":
+        if not DB_PATH.exists():
+            print("БД не найдена. Сначала: python3 mem.py init")
+            sys.exit(1)
+        conn = get_db()
+        _migrate_db(conn)
+        conn.close()
 
     elif cmd == "store":
         if not args:

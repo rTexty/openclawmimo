@@ -294,17 +294,28 @@ class PipelineProcessor:
         # Store memory + CHAOS (только для бизнес-типов)
         if label in ("task", "decision", "lead-signal", "risk"):
             importance = 0.8 if label in ("decision", "risk") else 0.6
-            await asyncio.to_thread(
-                self.brain.store_memory,
-                content=f"[{label}] {nm.text[:200]}",
-                mem_type="episodic",
-                importance=importance,
-                contact_id=item.contact_id,
-                chat_thread_id=item.chat_thread_id,
-                source_message_id=item.message_id,
-                content_hash=item.content_hash,
-                auto_associate=False,  # defer на nightly consolidate
-            )
+            content = f"[{label}] {nm.text[:200]}"
+
+            # ISSUE-03 fix: при re-process (edited) обновляем существующую memory,
+            # а не создаём дубль. supersede уже обновил messages.text и memories.content,
+            # но pipeline создаёт НОВУЮ memory при re-classify → дубль.
+            if item.source == "business_edited":
+                await asyncio.to_thread(
+                    self._update_existing_memory,
+                    item.message_id, content, item.content_hash, label, importance
+                )
+            else:
+                await asyncio.to_thread(
+                    self.brain.store_memory,
+                    content=content,
+                    mem_type="episodic",
+                    importance=importance,
+                    contact_id=item.contact_id,
+                    chat_thread_id=item.chat_thread_id,
+                    source_message_id=item.message_id,
+                    content_hash=item.content_hash,
+                    auto_associate=False,
+                )
             await asyncio.to_thread(
                 self.brain.chaos_store,
                 content=nm.text[:200],
@@ -429,6 +440,51 @@ class PipelineProcessor:
             conn.close()
 
         return " | ".join(parts)
+
+    def _update_existing_memory(self, message_id: int, content: str,
+                                content_hash: str, label: str, importance: float):
+        """ISSUE-03: при re-process (edited) обновляем существующую memory, не создаём дубль."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            existing = conn.execute(
+                "SELECT id FROM memories WHERE source_message_id = ?",
+                (message_id,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE memories
+                       SET content = ?, content_hash = ?, importance = ?,
+                           last_accessed_at = datetime('now')
+                       WHERE id = ?""",
+                    (content, content_hash, importance, existing["id"])
+                )
+                # Обновляем chaos_entries привязанные к этой memory
+                conn.execute(
+                    "UPDATE chaos_entries SET content = ? WHERE memory_id = ?",
+                    (content[:200], existing["id"])
+                )
+            else:
+                # Нет existing memory — создаём как обычно
+                conn.execute(
+                    """INSERT INTO memories (content, content_hash, type, importance,
+                                             strength, contact_id, chat_thread_id,
+                                             source_message_id)
+                       VALUES (?, ?, 'episodic', ?, 1.0, NULL, NULL, ?)""",
+                    (content, content_hash, importance, message_id)
+                )
+                mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                conn.execute(
+                    """INSERT INTO chaos_entries (content, category, priority, memory_id)
+                       VALUES (?, ?, ?, ?)""",
+                    (content[:200], label, importance, mid)
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Update memory error: {e}")
+        finally:
+            conn.close()
 
     def _mark_analyzed(self, message_id: int, label: str):
         conn = sqlite3.connect(self.db_path)

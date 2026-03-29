@@ -1,0 +1,5 @@
+# Lenochka Memory — dependencies
+sentence-transformers>=3.0
+sqlite-vec>=0.1
+numpy>=1.24
+requests>=2.28
