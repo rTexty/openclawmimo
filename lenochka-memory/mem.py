@@ -25,6 +25,7 @@ import sqlite3
 import sys
 import os
 import json
+import hashlib
 import struct
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -84,20 +85,20 @@ def init():
 
 def store(content, mem_type="episodic", importance=0.5, contact_id=None,
           chat_thread_id=None, deal_id=None, source_message_id=None, tags=None,
-          auto_associate=True):
+          content_hash=None, auto_associate=True):
     """Записать memory в Agent Memory + векторный эмбеддинг."""
     conn = get_db()
     tags_json = json.dumps(tags) if tags else None
+    chash = content_hash or _content_hash(content)
     conn.execute("""
-        INSERT INTO memories (content, type, importance, strength, contact_id,
+        INSERT INTO memories (content, content_hash, type, importance, strength, contact_id,
                              chat_thread_id, deal_id, source_message_id, tags)
-        VALUES (?, ?, ?, 1.0, ?, ?, ?, ?, ?)
-    """, (content, mem_type, importance, contact_id, chat_thread_id,
+        VALUES (?, ?, ?, ?, 1.0, ?, ?, ?, ?, ?)
+    """, (content, chash, mem_type, importance, contact_id, chat_thread_id,
           deal_id, source_message_id, tags_json))
-    conn.commit()
     mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-    # Векторный эмбеддинг → vec_memories
+    # Векторный эмбеддинг → vec_memories (в той же транзакции)
     try:
         from brain import embed_text, vec_to_blob
         vec = embed_text(content)
@@ -107,9 +108,11 @@ def store(content, mem_type="episodic", importance=0.5, contact_id=None,
                 "INSERT INTO vec_memories(rowid, embedding) VALUES (?, ?)",
                 (mid, vec_blob)
             )
-            conn.commit()
     except Exception as e:
         print(f"⚠️ Не удалось записать вектор: {e}", file=sys.stderr)
+
+    # Один COMMIT на обе операции (memory + vector)
+    conn.commit()
 
     conn.close()
     print(f"✅ Memory #{mid} записан [{mem_type}] importance={importance}")
@@ -184,8 +187,8 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
                     "score": abs(r["rank"]) if r["rank"] else 0,
                     "source": "chaos",
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ FTS chaos search error: {e}", file=sys.stderr)
 
     # 3. Keyword search по memories (LIKE fallback)
     if strategy in ("hybrid", "keyword"):
@@ -283,10 +286,9 @@ def chaos_store(content, category="other", priority=0.5,
         INSERT INTO chaos_entries (content, category, priority, memory_id, contact_id)
         VALUES (?, ?, ?, ?, ?)
     """, (content, category, priority, memory_id, contact_id))
-    conn.commit()
     eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-    # Векторный эмбеддинг → vec_chaos
+    # Векторный эмбеддинг → vec_chaos (в той же транзакции)
     try:
         from brain import embed_text, vec_to_blob
         vec = embed_text(content)
@@ -296,9 +298,11 @@ def chaos_store(content, category="other", priority=0.5,
                 "INSERT INTO vec_chaos(rowid, embedding) VALUES (?, ?)",
                 (eid, vec_blob)
             )
-            conn.commit()
     except Exception:
         pass
+
+    # Один COMMIT на обе операции
+    conn.commit()
 
     conn.close()
     print(f"✅ CHAOS #{eid} записан [{category}] priority={priority}")
@@ -492,13 +496,41 @@ def crm_daily_summary(date=None):
 
 # === INGEST (полный пайплайн) ===
 
-def ingest(text, contact_id=None, chat_thread_id=None):
+def _content_hash(text):
+    """SHA-256 хэш контента для дедупликации."""
+    return hashlib.sha256(text.strip().encode('utf-8')).hexdigest()[:16]
+
+
+def ingest(text, contact_id=None, chat_thread_id=None, source_message_id=None):
     """Полный пайплайн: classify → extract → store → chaos."""
     try:
         from brain import classify_message, extract_entities
     except ImportError:
         print("Модуль brain.py не найден")
         return None
+
+    # 0. Дедупликация по content hash
+    content_hash = _content_hash(text)
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM memories WHERE content_hash = ?", (content_hash,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        print(f"⏭️ Дубликат (hash={content_hash}), пропускаю")
+        return {"label": "duplicate", "skipped": True, "existing_id": existing["id"]}
+
+    # Также проверяем source_message_id если передан
+    if source_message_id:
+        existing_msg = conn.execute(
+            "SELECT id FROM memories WHERE source_message_id = ? AND chat_thread_id = ?",
+            (source_message_id, chat_thread_id)
+        ).fetchone()
+        if existing_msg:
+            conn.close()
+            print(f"⏭️ Дубликат (source_message_id={source_message_id}), пропускаю")
+            return {"label": "duplicate", "skipped": True, "existing_id": existing_msg["id"]}
+    conn.close()
 
     # 1. Классификация
     label, conf, reason = classify_message(text)
@@ -519,13 +551,15 @@ def ingest(text, contact_id=None, chat_thread_id=None):
             importance=importance,
             contact_id=contact_id,
             chat_thread_id=chat_thread_id,
+            source_message_id=source_message_id,
+            content_hash=content_hash,
             auto_associate=True,
         )
 
         # 4. CHAOS store
         chaos_store(
             content=text[:200],
-            category=label if label in ("decision", "risk") else "event",
+            category=label,
             priority=importance,
             memory_id=mid,
             contact_id=contact_id,
@@ -837,12 +871,14 @@ def main():
 
     elif cmd == "ingest":
         if not args:
-            print('Usage: mem.py ingest "текст сообщения" [--contact-id N] [--chat-thread-id N]')
+            print('Usage: mem.py ingest "текст сообщения" [--contact-id N] [--chat-thread-id N] [--source-message-id N]')
             sys.exit(1)
         text = " ".join(args)
         contact_id = int(get_arg("contact-id")) if get_arg("contact-id") else None
         chat_thread_id = int(get_arg("chat-thread-id")) if get_arg("chat-thread-id") else None
-        result = ingest(text, contact_id=contact_id, chat_thread_id=chat_thread_id)
+        source_message_id = get_arg("source-message-id")
+        result = ingest(text, contact_id=contact_id, chat_thread_id=chat_thread_id,
+                       source_message_id=source_message_id)
         if result:
             print(json.dumps(result, ensure_ascii=False, indent=2))
 

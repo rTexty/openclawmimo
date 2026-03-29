@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content TEXT NOT NULL,
+    content_hash TEXT,
     type TEXT NOT NULL CHECK(type IN ('episodic', 'semantic', 'procedural')),
     importance REAL DEFAULT 0.5 CHECK(importance >= 0 AND importance <= 1),
     strength REAL DEFAULT 1.0,
@@ -148,6 +149,7 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
+CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
 CREATE INDEX IF NOT EXISTS idx_memories_contact ON memories(contact_id);
 CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength);
@@ -196,7 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_raptor_parent ON raptor_nodes(parent_id);
 CREATE TABLE IF NOT EXISTS chaos_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content TEXT NOT NULL,
-    category TEXT CHECK(category IN ('decision', 'risk', 'policy', 'fact', 'event', 'other')),
+    category TEXT CHECK(category IN ('decision', 'risk', 'policy', 'fact', 'event', 'task', 'lead-signal', 'other')),
     priority REAL DEFAULT 0.5,
     memory_id INTEGER REFERENCES memories(id),
     contact_id INTEGER REFERENCES contacts(id),

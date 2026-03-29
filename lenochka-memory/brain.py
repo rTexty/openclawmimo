@@ -59,6 +59,22 @@ def embed_text(text):
     return _embed_fallback(text)
 
 
+def embed_texts_batch(texts):
+    """
+    Batch-эмбеддинг списка текстов.
+    ~7x быстрее чем embed_text() в цикле для N>5.
+    Возвращает list[list[float]].
+    """
+    if not texts:
+        return []
+    model = _get_embed_model()
+    if model is not None:
+        vecs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        return [v.tolist() for v in vecs]
+    # Fallback: поштучно
+    return [_embed_fallback(t) for t in texts]
+
+
 def _embed_fallback(text):
     """Char 3-gram TF embedding с fallback на EMBEDDING_DIM."""
     text = text.lower().strip()
@@ -115,32 +131,42 @@ def similarity(text1, text2):
 # =========================================================
 
 def _call_llm(system_prompt, user_prompt, temperature=0.0, max_tokens=2048):
-    """Вызов LLM через OpenAI-совместимый API."""
+    """Вызов LLM через OpenAI-совместимый API с retry/backoff."""
+    import time
+
     if not LLM_BASE_URL or not LLM_API_KEY:
         return None
-    try:
-        import requests
-        url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {LLM_API_KEY}",
-        }
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"LLM error: {e}", file=sys.stderr)
-        return None
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            import requests
+            url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {LLM_API_KEY}",
+            }
+            payload = {
+                "model": LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s, 4s
+                print(f"LLM retry {attempt + 1}/{max_retries} after {delay}s: {e}", file=sys.stderr)
+                time.sleep(delay)
+            else:
+                print(f"LLM error (all {max_retries} attempts failed): {e}", file=sys.stderr)
+                return None
 
 
 # =========================================================
@@ -324,82 +350,85 @@ def auto_associate(memory_id, content, threshold=0.35):
     associations = []
 
     try:
-        conn.enable_load_extension(True)
-        import sqlite_vec
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
 
-        # Векторный поиск через sqlite-vec
-        vec = embed_text(content)
-        vec_blob = vec_to_blob(vec)
+            # Векторный поиск через sqlite-vec
+            vec = embed_text(content)
+            vec_blob = vec_to_blob(vec)
 
-        rows = conn.execute("""
-            SELECT vm.rowid as memory_id, m.content, m.type, m.importance,
-                   distance
-            FROM vec_memories vm
-            JOIN memories m ON vm.rowid = m.id
-            WHERE vm.embedding MATCH ? AND k = 20 AND vm.rowid != ?
-            ORDER BY distance
-        """, (vec_blob, memory_id)).fetchall()
+            rows = conn.execute("""
+                SELECT vm.rowid as memory_id, m.content, m.type, m.importance,
+                       distance
+                FROM vec_memories vm
+                JOIN memories m ON vm.rowid = m.id
+                WHERE vm.embedding MATCH ? AND k = 20 AND vm.rowid != ?
+                ORDER BY distance
+            """, (vec_blob, memory_id)).fetchall()
 
-        for row in rows:
-            sim = 1.0 - row["distance  "] if "distance" in row.keys() else 0
-            if sim < threshold:
-                continue
-            rel_type = "supports" if sim > 0.8 else "related"
-
-            existing = conn.execute("""
-                SELECT id FROM associations
-                WHERE (memory_id_from = ? AND memory_id_to = ?)
-                   OR (memory_id_from = ? AND memory_id_to = ?)
-            """, (memory_id, row["memory_id"], row["memory_id"], memory_id)).fetchone()
-
-            if not existing:
-                conn.execute("""
-                    INSERT INTO associations (memory_id_from, memory_id_to, relation_type, weight)
-                    VALUES (?, ?, ?, ?)
-                """, (memory_id, row["memory_id"], rel_type, round(sim, 3)))
-                associations.append({
-                    "target_id": row["memory_id"],
-                    "relation": rel_type,
-                    "weight": round(sim, 3),
-                })
-    except Exception:
-        # Fallback: прямое сравнение cosine similarity
-        emb_source = embed_text(content)
-        rows = conn.execute("""
-            SELECT id, content FROM memories
-            WHERE id != ?
-            ORDER BY created_at DESC
-            LIMIT 200
-        """, (memory_id,)).fetchall()
-
-        for row in rows:
-            emb_target = embed_text(row["content"])
-            sim = cosine_similarity(emb_source, emb_target)
-
-            if sim >= threshold:
+            for row in rows:
+                sim = 1.0 - row["distance"] if "distance" in row.keys() else 0
+                if sim < threshold:
+                    continue
                 rel_type = "supports" if sim > 0.8 else "related"
 
                 existing = conn.execute("""
                     SELECT id FROM associations
                     WHERE (memory_id_from = ? AND memory_id_to = ?)
                        OR (memory_id_from = ? AND memory_id_to = ?)
-                """, (memory_id, row["id"], row["id"], memory_id)).fetchone()
+                """, (memory_id, row["memory_id"], row["memory_id"], memory_id)).fetchone()
 
                 if not existing:
                     conn.execute("""
                         INSERT INTO associations (memory_id_from, memory_id_to, relation_type, weight)
                         VALUES (?, ?, ?, ?)
-                    """, (memory_id, row["id"], rel_type, round(sim, 3)))
+                    """, (memory_id, row["memory_id"], rel_type, round(sim, 3)))
                     associations.append({
-                        "target_id": row["id"],
+                        "target_id": row["memory_id"],
                         "relation": rel_type,
                         "weight": round(sim, 3),
                     })
+        except Exception:
+            # Fallback: прямое сравнение cosine similarity
+            emb_source = embed_text(content)
+            rows = conn.execute("""
+                SELECT id, content FROM memories
+                WHERE id != ?
+                ORDER BY created_at DESC
+                LIMIT 200
+            """, (memory_id,)).fetchall()
 
-    conn.commit()
-    conn.close()
+            for row in rows:
+                emb_target = embed_text(row["content"])
+                sim = cosine_similarity(emb_source, emb_target)
+
+                if sim >= threshold:
+                    rel_type = "supports" if sim > 0.8 else "related"
+
+                    existing = conn.execute("""
+                        SELECT id FROM associations
+                        WHERE (memory_id_from = ? AND memory_id_to = ?)
+                           OR (memory_id_from = ? AND memory_id_to = ?)
+                    """, (memory_id, row["id"], row["id"], memory_id)).fetchone()
+
+                    if not existing:
+                        conn.execute("""
+                            INSERT INTO associations (memory_id_from, memory_id_to, relation_type, weight)
+                            VALUES (?, ?, ?, ?)
+                        """, (memory_id, row["id"], rel_type, round(sim, 3)))
+                        associations.append({
+                            "target_id": row["id"],
+                            "relation": rel_type,
+                            "weight": round(sim, 3),
+                        })
+
+        conn.commit()
+    finally:
+        conn.close()
+
     return associations
 
 
