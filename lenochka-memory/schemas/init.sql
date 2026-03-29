@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sent_at DATETIME NOT NULL,
     classification TEXT CHECK(classification IN ('noise', 'chit-chat', 'business-small', 'task', 'decision', 'lead-signal', 'risk', 'other')),
     analyzed INTEGER DEFAULT 0,
+    source_msg_id INTEGER,
     meta_json TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -53,6 +54,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent ON messages(sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_class ON messages(classification);
 CREATE INDEX IF NOT EXISTS idx_messages_analyzed ON messages(analyzed);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup ON messages(chat_thread_id, source_msg_id)
+    WHERE source_msg_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -2,6 +2,7 @@
 aiogram>=3.26.0
 pydantic-settings>=2.0
 apscheduler>=3.10
+aiohttp>=3.9
 
 # Brain (from lenochka-memory)
 # sentence-transformers>=5.0  # optional

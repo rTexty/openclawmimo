@@ -1,8 +1,13 @@
 """
 Memory Service — обёртка над mem.py для bot-специфичных операций.
-Dedup, store message, soft-delete, status queries, business connections.
+Dedup, supersede, soft-delete, store message, status queries, business connections.
+
+Ключевое архитектурное решение: source_msg_id — отдельная колонка в messages,
+а НЕ кусок meta_json. Это даёт UNIQUE index для дедупликации и прямой lookup
+для supersede (edited) и soft-delete (deleted).
 """
 import sqlite3
+import json
 import logging
 import hashlib
 from aiogram.types import Message
@@ -18,23 +23,27 @@ def content_hash(text: str) -> str:
 def dedup_check(msg: Message, normalized_text: str, db_path: str) -> str | None:
     """
     Проверка дубликата. Возвращает content_hash если НЕ дубликат, None если дубль.
-    Проверяет: source_message_id + chat_id и content_hash (за 24ч).
+    Источники дублей: Telegram retry, restart long-polling, ручной ingest.
+    
+    Проверяет:
+    1. source_msg_id + chat_thread_id (UNIQUE index — O(1) lookup)
+    2. content_hash за последние 24ч (fuzzy дедуп)
     """
     ch = content_hash(normalized_text)
     conn = get_db(db_path)
     try:
-        # Check source_message_id + chat_thread_id
+        # 1. Telegram message_id уникален в рамках чата
         existing = conn.execute(
             """SELECT m.id FROM messages m
                JOIN chat_threads ct ON m.chat_thread_id = ct.id
-               WHERE ct.tg_chat_id = ? AND m.meta_json LIKE ?
+               WHERE ct.tg_chat_id = ? AND m.source_msg_id = ?
                LIMIT 1""",
-            (str(msg.chat.id), f'%"{msg.message_id}"%'),
+            (str(msg.chat.id), msg.message_id),
         ).fetchone()
         if existing:
             return None
 
-        # Check content_hash (last 24h)
+        # 2. Content hash — защита от одинаковых текстов в разных чатах
         existing = conn.execute(
             """SELECT id FROM memories
                WHERE content_hash = ? AND created_at > datetime('now', '-1 day')""",
@@ -52,21 +61,15 @@ def store_message(chat_thread_id: int, from_user_id: str, text: str,
                   sent_at, content_type: str, meta: dict | None,
                   source_msg_id: int, content_hash_val: str,
                   db_path: str) -> int:
-    """Сохранить raw message в CRM messages table."""
-    import json
+    """Сохранить raw message в CRM messages table с source_msg_id."""
     conn = get_db(db_path)
     try:
-        # Сохраняем source_msg_id в meta_json для дедупликации
-        full_meta = meta or {}
-        full_meta["_source_msg_id"] = source_msg_id
-        full_meta["_content_hash"] = content_hash_val
-
         conn.execute(
             """INSERT INTO messages (chat_thread_id, from_user_id, text, sent_at,
-                                     classification, analyzed, meta_json)
-               VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, 0, ?)""",
+                                     classification, analyzed, source_msg_id, meta_json)
+               VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, 0, ?, ?)""",
             (chat_thread_id, from_user_id, text, sent_at,
-             None, json.dumps(full_meta)),
+             None, source_msg_id, json.dumps(meta) if meta else None),
         )
         mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
@@ -75,32 +78,81 @@ def store_message(chat_thread_id: int, from_user_id: str, text: str,
         conn.close()
 
 
+def supersede_message(chat_thread_id: int, source_msg_id: int,
+                      new_text: str, new_meta: dict | None, db_path: str) -> int | None:
+    """
+    Supersede: обновить существующее сообщение при редактировании.
+    
+    Ищем message по (chat_thread_id, source_msg_id):
+      - Найдена → UPDATE text, сброс classification/analyzed для повторной обработки
+      - Не найдена → возвращаем None, pipeline создаёт как новое
+    
+    Архитектурное решение: обновляем ТОЛЬКО messages.text и сбрасываем флаги.
+    memories и chaos_entries НЕ трогаем — они хранят уже классифицированный контент.
+    Переклассификация через nightly consolidate или ручную /reclassify.
+    """
+    conn = get_db(db_path)
+    try:
+        row = conn.execute(
+            """SELECT id, text FROM messages
+               WHERE chat_thread_id = ? AND source_msg_id = ?""",
+            (chat_thread_id, source_msg_id),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        msg_id = row["id"]
+
+        conn.execute(
+            """UPDATE messages
+               SET text = ?, classification = NULL, analyzed = 0,
+                   meta_json = json_set(
+                       COALESCE(meta_json, '{}'),
+                       '$.edited', 1,
+                       '$.prev_text', ?
+                   )
+               WHERE id = ?""",
+            (new_text, row["text"], msg_id),
+        )
+        conn.commit()
+        logger.info(f"Supersede: msg#{msg_id} edited (source_msg_id={source_msg_id})")
+        return msg_id
+    finally:
+        conn.close()
+
+
 def soft_delete_messages(chat_id: int, message_ids: list[int], db_path: str):
     """
-    Soft-delete: помечаем удалённые сообщения.
+    Soft-delete: помечаем удалённые сообщения через source_msg_id.
     
-    Архитектурное решение: meta_json.deleted=1 вместо физического удаления.
-    Это сохраняет целостность FK (memories.source_message_id → messages.id).
-    Позже — отдельный cron для физической архивации старых deleted.
+    Telegram шлёт deleted_business_messages с message_ids (Telegram message_id).
+    Lookup: (chat_thread_id, source_msg_id) → UNIQUE index, O(1).
+    
+    НЕ физически удаляем — FK memories.source_message_id → messages.id
+    должен оставаться валидным. Физическая архивация — отдельный cron >1 года.
     """
     if not message_ids:
         return
     conn = get_db(db_path)
     try:
-        # Ищем internal message id по source_msg_id в meta_json
-        for msg_id in message_ids:
+        for tg_msg_id in message_ids:
             conn.execute(
                 """UPDATE messages SET meta_json = json_set(
                         COALESCE(meta_json, '{}'), '$.deleted', 1
                    )
-                   WHERE meta_json LIKE ?""",
-                (f'%"{msg_id}"%',),
+                   WHERE chat_thread_id = (
+                       SELECT id FROM chat_threads WHERE tg_chat_id = ?
+                   ) AND source_msg_id = ?""",
+                (str(chat_id), tg_msg_id),
             )
         conn.commit()
         logger.info(f"Soft-deleted {len(message_ids)} messages in chat {chat_id}")
     finally:
         conn.close()
 
+
+# === Business Connections ===
 
 def get_business_status(user_id: int, db_path: str) -> dict:
     """Статус business-подключения из реальной таблицы."""
@@ -131,7 +183,7 @@ def register_business_connection(user_id: int, connection_id: str,
     conn = get_db(db_path)
     try:
         conn.execute("""
-            INSERT INTO business_connections 
+            INSERT INTO business_connections
                 (connection_id, owner_user_id, status, can_reply, can_read_messages)
             VALUES (?, ?, 'active', ?, ?)
             ON CONFLICT(connection_id) DO UPDATE SET
@@ -167,8 +219,7 @@ def revoke_business_connection(connection_id: str, db_path: str):
 def get_owner_by_connection(connection_id: str, db_path: str) -> int | None:
     """
     Маппинг business_connection_id → owner_user_id.
-    Критично для определения кому принадлежит входящее сообщение
-    при мульти-юзерной конфигурации.
+    Критично для мульти-юзера: определяем кому принадлежит входящее сообщение.
     """
     conn = get_db(db_path)
     try:
@@ -181,6 +232,8 @@ def get_owner_by_connection(connection_id: str, db_path: str) -> int | None:
     finally:
         conn.close()
 
+
+# === Status / Search Queries ===
 
 def get_status_summary(db_path: str) -> dict:
     """Сводка для /status команды."""

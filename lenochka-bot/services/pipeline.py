@@ -186,7 +186,11 @@ class PipelineProcessor:
                 logger.error(f"Finalize error: {e}", exc_info=True)
 
     async def _normalize_and_store(self, item: PipelineItem):
-        """Normalize + dedup + resolve contact + store raw message."""
+        """
+        Normalize + dedup/supersede + resolve contact + store raw message.
+        
+        Для business_edited: supersede существующую запись вместо создания дубля.
+        """
         msg = item.message
 
         # 1. Normalize
@@ -195,7 +199,32 @@ class PipelineProcessor:
             return
         item.normalized = nm
 
-        # 2. Dedup
+        # 2. Resolve contact + chat thread (нужно для supersede lookup)
+        contact_id, chat_thread_id = await asyncio.to_thread(
+            resolve_contact, msg, item.source, self.db_path
+        )
+        item.contact_id = contact_id
+        item.chat_thread_id = chat_thread_id
+
+        # 3. Supersede для edited messages
+        if item.source == "business_edited":
+            existing_id = await asyncio.to_thread(
+                mem_svc.supersede_message,
+                chat_thread_id=chat_thread_id,
+                source_msg_id=msg.message_id,
+                new_text=nm.text,
+                new_meta=nm.metadata,
+                db_path=self.db_path,
+            )
+            if existing_id:
+                # Нашли и обновили — pipeline обработает classification заново
+                item.message_id = existing_id
+                item.content_hash = mem_svc.content_hash(nm.text)
+                logger.info(f"Supersede: msg#{existing_id} updated from edit")
+                return
+            # Не нашли — treat as new message, падаем в обычный flow ниже
+
+        # 4. Dedup для новых сообщений
         ch = await asyncio.to_thread(
             mem_svc.dedup_check, msg, nm.text, self.db_path
         )
@@ -204,14 +233,7 @@ class PipelineProcessor:
             return
         item.content_hash = ch
 
-        # 3. Resolve contact + chat thread
-        contact_id, chat_thread_id = await asyncio.to_thread(
-            resolve_contact, msg, item.source, self.db_path
-        )
-        item.contact_id = contact_id
-        item.chat_thread_id = chat_thread_id
-
-        # 4. Store raw message
+        # 5. Store raw message
         mid = await asyncio.to_thread(
             mem_svc.store_message,
             chat_thread_id=chat_thread_id,
