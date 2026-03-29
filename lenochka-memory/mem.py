@@ -231,9 +231,7 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
                 "score": score, "source": "agent_memory",
             })
 
-    conn.close()
-
-    # Dedup + sort
+    # Dedup + sort (conn открыт — entity expansion ниже его использует)
     seen = set()
     unique = []
     for r in results:
@@ -245,8 +243,9 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
     unique.sort(key=lambda x: x.get("score", 0), reverse=True)
 
     # Entity-aware expansion: расширяем контекст по FK-связям
+    # Передаём существующий conn (одно соединение на весь recall)
     if unique:
-        expansion = _expand_entity_context(unique[:5], conn=None)
+        expansion = _expand_entity_context(unique[:5], conn=conn)
         # Добавляем расширенный контекст как отдельную секцию
         if expansion:
             unique.append({
@@ -259,6 +258,7 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
                 "_expansion": expansion,
             })
 
+    conn.close()
     return unique[:limit]
 
 
@@ -447,7 +447,7 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
                 FROM messages m
                 JOIN chat_threads ct ON m.chat_thread_id = ct.id
                 WHERE m.chat_thread_id IN ({placeholders})
-                  AND (m.meta_json IS NULL OR m.meta_json NOT LIKE '%"deleted": 1%')
+                  AND (m.meta_json IS NULL OR json_extract(m.meta_json, '$.deleted') IS NULL)
                 ORDER BY m.sent_at DESC
                 LIMIT ?
             """, list(chat_thread_ids) + [max_messages]).fetchall()

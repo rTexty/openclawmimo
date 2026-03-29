@@ -347,7 +347,7 @@ class PipelineProcessor:
         try:
             rows = conn.execute(
                 """SELECT text, from_user_id, sent_at FROM messages
-                   WHERE chat_thread_id = ? AND (meta_json IS NULL OR meta_json NOT LIKE '%"deleted": 1%')
+                   WHERE chat_thread_id = ? AND (meta_json IS NULL OR json_extract(meta_json, '$.deleted') IS NULL)
                    ORDER BY sent_at DESC LIMIT 5""",
                 (chat_thread_id,),
             ).fetchall()
