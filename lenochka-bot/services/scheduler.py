@@ -1,4 +1,5 @@
 """Scheduler — дайджесты, consolidate, abandoned check."""
+import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from config import settings
@@ -56,7 +57,7 @@ async def _weekly_report(bot, brain):
 
 async def _consolidate(brain):
     from services import memory as mem
-    mem.run_consolidation(settings.db_path, brain)
+    await asyncio.to_thread(mem.run_consolidation, settings.db_path, brain)
 
 
 async def _check_abandoned(bot, brain):

@@ -97,9 +97,10 @@ class PipelineProcessor:
                 batch = [item]
 
                 # Собираем остальные из очереди (до 1 сек)
-                deadline = asyncio.get_event_loop().time() + 1.0
+                import time
+                deadline = time.monotonic() + 1.0
                 while len(batch) < self.batch_size:
-                    timeout = max(0.01, deadline - asyncio.get_event_loop().time())
+                    timeout = max(0.01, deadline - time.monotonic())
                     if timeout <= 0.01:
                         break
                     try:
@@ -239,7 +240,7 @@ class PipelineProcessor:
             chat_thread_id=chat_thread_id,
             from_user_id=str(msg.from_user.id) if msg.from_user else "self",
             text=nm.text,
-            sent_at=msg.date,
+            sent_at=msg.date.timestamp() if hasattr(msg.date, 'timestamp') else msg.date,
             content_type=nm.content_type,
             meta=nm.metadata,
             source_msg_id=msg.message_id,
@@ -300,11 +301,13 @@ class PipelineProcessor:
             # а не создаём дубль. supersede уже обновил messages.text и memories.content,
             # но pipeline создаёт НОВУЮ memory при re-classify → дубль.
             if item.source == "business_edited":
+                # Обновляем существующую memory + chaos (внутри _update_existing_memory)
                 await asyncio.to_thread(
                     self._update_existing_memory,
                     item.message_id, content, item.content_hash, label, importance
                 )
             else:
+                # Новая memory
                 await asyncio.to_thread(
                     self.brain.store_memory,
                     content=content,
@@ -316,13 +319,15 @@ class PipelineProcessor:
                     content_hash=item.content_hash,
                     auto_associate=False,
                 )
-            await asyncio.to_thread(
-                self.brain.chaos_store,
-                content=nm.text[:200],
-                category=label,
-                priority=importance,
-                contact_id=item.contact_id,
-            )
+                # Новый chaos entry (только для новых — _update_existing_memory
+                # уже обновил chaos для edited)
+                await asyncio.to_thread(
+                    self.brain.chaos_store,
+                    content=nm.text[:200],
+                    category=label,
+                    priority=importance,
+                    contact_id=item.contact_id,
+                )
 
         # CRM upsert
         if entities and label not in ("noise", "chit-chat"):
