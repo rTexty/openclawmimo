@@ -316,3 +316,32 @@ LEFT JOIN contacts c ON ct.contact_id = c.id
 WHERE m.from_user_id != 'self'
 GROUP BY ct.id
 HAVING hours_since > 24;
+
+-- ============================================
+-- ПРОАКТИВНЫЙ ДВИЖОК: pending notifications
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS pending_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_thread_id INTEGER REFERENCES chat_threads(id),
+    contact_id INTEGER REFERENCES contacts(id),
+    message_id INTEGER REFERENCES messages(id),
+    message_text TEXT,
+    entity_type TEXT,           -- 'escalation', 'owner_task', 'owner_agreement', 'owner_deal', 'owner_invoice', 'client_invoice', 'client_agreement', 'client_task', 'checkin'
+    entity_id INTEGER,          -- id в соответствующей таблице (tasks.id, agreements.id, etc.)
+    escalation_type TEXT,       -- 'pricing', 'proposal', 'contract', 'meeting', 'complaint', 'other', 'task_due', etc.
+    notify_at DATETIME NOT NULL,
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'cancelled')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_notify_status ON pending_notifications(status, notify_at);
+CREATE INDEX IF NOT EXISTS idx_pending_notify_entity ON pending_notifications(entity_type, entity_id);
+
+-- ============================================
+-- PROGRESS CHECK-IN tracking
+-- ============================================
+
+-- Добавляем в tasks: когда последний раз проверяли прогресс
+-- (через ALTER при миграции, здесь для новых БД)
+-- last_progress_check уже есть в schema v2 через миграцию

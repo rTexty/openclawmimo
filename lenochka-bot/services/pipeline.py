@@ -143,7 +143,7 @@ class PipelineProcessor:
         if not valid_items:
             return
 
-        # Phase 2: Batch classify — ОДИН LLM-вызов на весь батч
+        # Phase 2: COMBINED classify + route — ОДИН LLM-вызов на весь батч
         texts = [item.normalized.full_text for item in valid_items]
         chat_contexts = []
 
@@ -153,15 +153,17 @@ class PipelineProcessor:
             )
             chat_contexts.append(ctx)
 
-        classifications = await asyncio.to_thread(
-            self._batch_classify, texts, chat_contexts
+        from services.response_engine import classify_and_route_batch
+        decisions = await asyncio.to_thread(
+            classify_and_route_batch, texts, chat_contexts, self.brain
         )
 
         # Phase 3: Batch embed — ОДИН forward pass на весь батч
         # Собираем тексты для эмбеддинга (только важные типы)
         important_texts = []
         important_indices = []
-        for i, (label, _, _) in enumerate(classifications):
+        for i, d in enumerate(decisions):
+            label = d.get("label", "other")
             if label in ("task", "decision", "lead-signal", "risk"):
                 important_texts.append(texts[i])
                 important_indices.append(i)
@@ -177,14 +179,13 @@ class PipelineProcessor:
             except Exception as e:
                 logger.warning(f"Batch embed failed, falling back: {e}")
 
-        # Phase 4: Extract + store (поштучно, только для важных)
+        # Phase 4: Process each item — store + response handling
         for i, item in enumerate(valid_items):
             try:
-                label, conf, reason = classifications[i]
-                await self._finalize_item(item, label, conf, reason,
-                                          embeddings.get(i))
+                d = decisions[i] if i < len(decisions) else {"label": "other", "action": "escalate"}
+                await self._process_decision(item, d, embeddings.get(i))
             except Exception as e:
-                logger.error(f"Finalize error: {e}", exc_info=True)
+                logger.error(f"Process decision error: {e}", exc_info=True)
 
     async def _normalize_and_store(self, item: PipelineItem):
         """
@@ -249,102 +250,174 @@ class PipelineProcessor:
         )
         item.message_id = mid
 
-    def _batch_classify(self, texts: list[str],
-                        chat_contexts: list[str]) -> list[tuple]:
+    async def _process_decision(self, item: PipelineItem, decision: dict,
+                                embedding=None):
         """
-        Batch classify: ОДИН LLM-вызов на N сообщений.
-        
-        Делегирует в brain.classify_batch() — чистый API.
-        При недоступности LLM fallback на heuristic поштучно.
+        Обработать одно сообщение: store memory + response handling.
+        Combined classify+route дал нам label + action + intent в одном объекте.
         """
-        if not texts:
-            return []
-
-        if self.brain.is_ready():
-            try:
-                return self.brain.classify_batch(texts, chat_contexts)
-            except Exception as e:
-                logger.warning(f"Batch classify failed: {e}")
-
-        # Fallback: heuristic поштучно
-        from brain import _classify_heuristic
-        return [_classify_heuristic(t) for t in texts]
-
-    async def _finalize_item(self, item: PipelineItem, label: str,
-                             conf: float, reason: str, embedding=None):
-        """Extract entities + store memory + CHAOS + CRM для одного item."""
         nm = item.normalized
+        label = decision.get("label", "other")
+        action = decision.get("action", "escalate")
+        intent = decision.get("intent")
+        conf = decision.get("confidence", 0.5)
 
-        # Extract entities (только для важных типов — экономим LLM)
+        # --- Extract entities (только для важных типов) ---
         entities = {}
-        if label not in ("noise", "chit-chat") and self.brain.is_ready():
+        if label not in ("noise", "chit-chat", "business-small") and self.brain.is_ready():
             chat_ctx = await asyncio.to_thread(
                 self._get_chat_context, item.chat_thread_id
             )
-
-            # Enrich: entity expansion — LLM узнаёт существующие contacts/deals/tasks
             enriched_ctx = await asyncio.to_thread(
                 self._enrich_extract_context, chat_ctx,
                 item.contact_id, item.chat_thread_id
             )
-
             entities = await asyncio.to_thread(
                 self.brain.extract_entities, nm.full_text, label, enriched_ctx
             )
 
-        # Store memory + CHAOS (только для бизнес-типов)
+        # --- Store memory + CHAOS (для бизнес-типов) ---
         if label in ("task", "decision", "lead-signal", "risk"):
             importance = 0.8 if label in ("decision", "risk") else 0.6
             content = f"[{label}] {nm.text[:200]}"
 
-            # ISSUE-03 fix: при re-process (edited) обновляем существующую memory,
-            # а не создаём дубль. supersede уже обновил messages.text и memories.content,
-            # но pipeline создаёт НОВУЮ memory при re-classify → дубль.
             if item.source == "business_edited":
-                # Обновляем существующую memory + chaos (внутри _update_existing_memory)
                 await asyncio.to_thread(
                     self._update_existing_memory,
                     item.message_id, content, item.content_hash, label, importance
                 )
             else:
-                # Новая memory
                 await asyncio.to_thread(
                     self.brain.store_memory,
-                    content=content,
-                    mem_type="episodic",
-                    importance=importance,
-                    contact_id=item.contact_id,
-                    chat_thread_id=item.chat_thread_id,
-                    source_message_id=item.message_id,
-                    content_hash=item.content_hash,
+                    content=content, mem_type="episodic", importance=importance,
+                    contact_id=item.contact_id, chat_thread_id=item.chat_thread_id,
+                    source_message_id=item.message_id, content_hash=item.content_hash,
                     auto_associate=False,
                 )
-                # Новый chaos entry (только для новых — _update_existing_memory
-                # уже обновил chaos для edited)
                 await asyncio.to_thread(
                     self.brain.chaos_store,
-                    content=nm.text[:200],
-                    category=label,
-                    priority=importance,
+                    content=nm.text[:200], category=label, priority=importance,
                     contact_id=item.contact_id,
                 )
 
-        # CRM upsert
+        # --- CRM upsert ---
         if entities and label not in ("noise", "chit-chat"):
             await asyncio.to_thread(
                 crm_upsert, entities, item.contact_id,
                 item.chat_thread_id, item.message_id, self.db_path
             )
 
-        # Mark analyzed
+        # --- Follow-up detection (для бизнес-типов) ---
+        if label in ("task", "decision", "lead-signal", "risk", "business-small"):
+            try:
+                from services.response_engine import detect_followups
+                chat_ctx = await asyncio.to_thread(
+                    self._get_chat_context, item.chat_thread_id
+                )
+                followups = await asyncio.to_thread(
+                    detect_followups, nm.full_text, chat_ctx, self.brain
+                )
+                for fu in followups:
+                    await asyncio.to_thread(
+                        _create_followup_task, fu, item.contact_id,
+                        item.chat_thread_id, item.message_id, self.db_path
+                    )
+            except Exception as e:
+                logger.warning(f"Follow-up detection error: {e}")
+
+        # --- Mark analyzed ---
         await asyncio.to_thread(
             self._mark_analyzed, item.message_id, label
         )
 
+        # --- Response handling ---
+        if action == "respond_fact" and intent:
+            await self._handle_fact_response(item, decision)
+        elif action == "escalate":
+            await self._handle_escalation(item, decision)
+        # skip → ничего
+
         logger.info(
-            f"Ingest: msg#{item.message_id} [{label}] conf={conf:.2f} "
-            f"contact={item.contact_id} type={nm.content_type}"
+            f"Ingest: msg#{item.message_id} [{label}] action={action} "
+            f"conf={conf:.2f} contact={item.contact_id}"
         )
+
+    async def _handle_fact_response(self, item: PipelineItem, decision: dict):
+        """Ответить клиенту фактами из БД."""
+        from services.response_engine import (
+            response_guard, generate_fact_response, fast_dialog_ended,
+        )
+        from services.fact_queries import query_fact
+
+        # Anti-spam check
+        allowed, reason = response_guard.can_respond(item.chat_thread_id)
+        if not allowed:
+            logger.info(f"Response guard: {reason} for chat {item.chat_thread_id}")
+            if reason == "max_consecutive":
+                await self._handle_escalation(item, decision)
+            return
+
+        # Fast path: dialog ended
+        if item.normalized and fast_dialog_ended(item.normalized.text):
+            return
+
+        # Query facts from DB
+        intent = decision.get("intent", "")
+        query_hint = decision.get("query_hint", "")
+        facts = await asyncio.to_thread(
+            query_fact, intent, query_hint,
+            item.contact_id, item.chat_thread_id, self.db_path
+        )
+
+        if not facts:
+            # Нет данных → escalate вместо выдумывания
+            await self._handle_escalation(item, decision)
+            return
+
+        # Generate natural response
+        contact_name = _get_contact_name_sync(item.contact_id, self.db_path)
+        response_text = await asyncio.to_thread(
+            generate_fact_response,
+            item.normalized.text if item.normalized else "",
+            facts, contact_name, self.brain
+        )
+
+        if not response_text:
+            await self._handle_escalation(item, decision)
+            return
+
+        # Send response via business API
+        biz_conn = await asyncio.to_thread(
+            _get_active_biz_connection, self.db_path
+        )
+        if not biz_conn:
+            await self._handle_escalation(item, decision)
+            return
+
+        chat_id = await asyncio.to_thread(
+            _get_tg_chat_id, item.chat_thread_id, self.db_path
+        )
+        if not chat_id:
+            return
+
+        try:
+            await self.bot.send_message(
+                chat_id=int(chat_id),
+                text=response_text,
+                business_connection_id=biz_conn,
+            )
+            response_guard.record_response(item.chat_thread_id)
+            logger.info(f"Fact response sent to chat {item.chat_thread_id}: {response_text[:60]}")
+        except Exception as e:
+            logger.error(f"Failed to send fact response: {e}")
+
+    async def _handle_escalation(self, item: PipelineItem, decision: dict):
+        """Эскалация → notifier (таймер → owner notification)."""
+        try:
+            from services.notifier import handle_escalation
+            await handle_escalation(self.bot, item, decision, self.db_path)
+        except Exception as e:
+            logger.error(f"Escalation error: {e}")
 
     def _get_chat_context(self, chat_thread_id: int) -> str:
         """
