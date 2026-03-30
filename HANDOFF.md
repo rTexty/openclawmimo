@@ -850,3 +850,85 @@ fad2890 Architecture: Telegram Bot + Business API integration
 c052d76 Phase 1 fixes (7 items)
 8d5ea28 Lenochka Memory v2 — initial implementation
 ```
+
+
+
+# SESSION HANDOFF — Lenochka Project
+# Сессия 2026-03-30 15:41 — 16:35 GMT+8
+# Камиль + Леночка
+
+## Что произошло
+
+### Предыдущие сессии (все выше в этом файле)
+
+### Эта сессия (2026-03-30 15:41 — 16:35)
+
+1. **Перенос в OpenClaw:** Удалены текущие файлы, склонирован https://github.com/rTexty/openclawmimo.git. PAT для push настроен. Регулярные коммиты и пуши.
+
+2. **Глубокое погружение в контекст:** Изучены ВСЕ файлы проекта (50+ файлов, ~7000 строк кода + ~5000 строк документации):
+   - HANDOFF.md (история 7 сессий)
+   - BLUEPRINT.md (полная карта проекта)
+   - ARCHITECTURE-TELEGRAM-BOT.md (1644 строк)
+   - RESPONSE-ENGINE-ARCHITECTURE.md (2683 строк)
+   - lenochka-context/*.md (3 файла контекста)
+   - lenochka-memory/ (mem.py, brain.py, init.sql, AUDIT.md, SKILL.md)
+   - lenochka-bot/ (все 16+ файлов)
+
+3. **Аудит Response Engine architecture vs implementation:**
+   - Проведён полный сравнительный анализ RESPONSE-ENGINE-ARCHITECTURE.md с реальным кодом
+   - Найдено 7 gaps (реальных расхождений архитектуры и кода)
+
+4. **Камиль: "желтые и зеленые надо сделать"** — 5 задач:
+
+   **Итерация 1 — 5 gaps (коммит 7227f6a):**
+   - **Aggregate notifications:** Переписан `_check_and_notify_later` — теперь агрегирует ВСЕ pending для одного чата ПЕРЕД отправкой. Раньше: сначала отправлял индивидуальное, потом агрегировались остальные = дубли. Теперь: `_aggregate_and_send` собирает все pending и шлёт одно сводное. Удалён старый `_aggregate_and_send_pending`.
+   - **Memories FTS:** Добавлен 4-й источник в `recall()`: `memories_fts` trigram search. Раньше: только `chaos_fts` + vector + keyword LIKE. Теперь: vector + chaos FTS + memories FTS + keyword LIKE → RRF на 4 источниках.
+   - **RRF dedup fix:** `_item_key()` и dedup в `_rrf_rank()` — `agent_memory`, `agent_memory_fts`, `vector` теперь дедуплицируются по `("memory", id)` а не по `(source, id)`. Одна и та же memory из разных источников = один результат.
+   - **progress.py** (новый файл, 220 строк): `parse_progress_reply`, `apply_progress_update`, `format_progress_confirmation`, `extract_task_id_from_checkin`, `get_task_by_id`. Вынесен из response_engine.py + commands.py. Удалены дублирующие функции из commands.py.
+   - **response_context.py** (новый файл, 200 строк): `build_chat_context`, `build_crm_context`, `build_notification_context`, `format_context_block`. Вынесен из pipeline.py + notifier.py. Pipeline теперь делегирует `_get_chat_context` и `_enrich_extract_context` в response_context.
+
+5. **Камиль: "Реши все"** — 5 проблем из аудита (коммит 736233f):
+   - **Owner в бизнес-чате → бот отвечает самому себе:** В `_process_decision` добавлена проверка `from_user.id == settings.owner_id` — owner пишет → ingest, но НЕ response.
+   - **Групповые чаты → бот отвечает на всё:** Добавлена проверка `chat.type in ('group', 'supergroup')` — group → ingest, но НЕ response (без mention).
+   - **Combined prompt не получает CRM контекст:** `classify_and_route_batch` теперь принимает `crm_contexts` параметр. В pipeline Phase 2 собирается crm_context для каждого item и передаётся в combined prompt. LLM видит existing contact/deals/tasks при решении respond_fact vs escalate.
+   - **Night mode не применяется к client reminders:** `send_client_reminders()` теперь проверяет `hour < 9 or hour >= 20` → skip.
+   - **Progress check-in не использует отдельное поле:** Добавлен `tasks.last_progress_check` в schema (init.sql + миграция v4). `_get_checkin_candidates` фильтрует по `last_progress_check` вместо `updated_at`. `send_progress_checkins` обновляет `last_progress_check`.
+
+## Структура файлов (новые/изменённые)
+
+```
+НОВЫЕ ФАЙЛЫ:
+  lenochka-bot/services/progress.py          # 220 строк — progress check-in
+  lenochka-bot/services/response_context.py  # 200 строк — context building
+
+ИЗМЕНЁННЫЕ:
+  lenochka-bot/services/notifier.py          # aggregate перед отправкой, delegate context
+  lenochka-bot/services/pipeline.py          # owner/group check, crm_context в combined
+  lenochka-bot/services/response_engine.py   # crm_contexts param, delegate progress
+  lenochka-bot/services/proactive.py         # night mode client, last_progress_check
+  lenochka-bot/handlers/commands.py          # imports из progress.py, удалены локальные helpers
+  lenochka-memory/mem.py                     # memories FTS source, RRF dedup fix, migration v4
+  lenochka-memory/schemas/init.sql           # tasks.last_progress_check column
+```
+
+## Ключевые решения
+
+1. **Aggregate ПЕРЕД отправкой** — не после. Один чат = одно сводное уведомление owner'у.
+2. **4 источника RRF** — vector + chaos FTS + memories FTS + keyword LIKE. Cross-source dedup по memory id.
+3. **Owner check в pipeline** — owner пишет в бизнес-чат → ingest для CRM, НЕ response.
+4. **Group check в pipeline** — group messages → ingest, НЕ response. Mention detection — TODO.
+5. **CRM контекст в combined prompt** — LLM при classify+route видит existing deals/tasks. Лучшее решение respond_fact vs escalate.
+6. **Night mode для client reminders** — 09:00-20:00 только. Не спамить клиентов ночью.
+7. **last_progress_check как отдельное поле** — не трогаем updated_at. Миграция v4.
+
+## Что работает (проверено)
+
+- ✅ Все файлы компилируются без ошибок
+- ✅ Git: 2 коммита, оба запушены на main
+
+## Git log (новые коммиты этой сессии)
+
+```
+736233f Fix 5 issues: owner check, group filter, CRM context, night mode, last_progress_check
+7227f6a Fix 5 gaps: aggregate notifications, memories FTS+RRF, progress.py, response_context.py
+```
