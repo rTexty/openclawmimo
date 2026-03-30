@@ -11,8 +11,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from services.brain_wrapper import get_db
-from services.response_engine import parse_progress_reply_llm, format_progress_confirmation
-
 logger = logging.getLogger("lenochka.proactive")
 
 GMT8 = timezone(timedelta(hours=8))

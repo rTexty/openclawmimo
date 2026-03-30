@@ -33,7 +33,7 @@ def query_fact(intent: str, query_hint: str, contact_id: int | None,
         return None
 
     try:
-        return fn(contact_id, query_hint, chat_thread_id, db_path)
+        return fn(contact_id, query_hint, chat_thread_id, db_path)  # query_hint maps to 'hint' param
     except Exception as e:
         logger.error(f"query_fact({intent}) error: {e}")
         return None

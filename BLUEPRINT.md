@@ -29,7 +29,8 @@
 | sqlite-vec | ✅ Установлен, работает | v0.1.7 |
 | sentence-transformers | ✅ Установлен, работает | v5.3.0, all-MiniLM-L6-v2, 384-dim |
 | Entity expansion | ✅ FK-traversal chain в recall + context_packet + /find + pipeline | `mem.py` + `brain.py` |
-| Response Engine | ❌ Не реализован | Phase 3 |
+| Response Engine | ❌ Не реализован (← запись до сессии 2026-03-30 14:50) | Phase 3 |
+| Response Engine v2 | ✅ Реализован: combined classify+route, fact-based response, escalation, proactive, progress check-in, follow-up detection, ResponseGuard | см. `RESPONSE-ENGINE-ARCHITECTURE.md` + `lenochka-bot/services/response_engine.py` |
 | Voice Transcription | ❌ Не реализован | Phase 4 |
 | OCR | ❌ Не реализован | Phase 4 |
 | Multi-user | ❌ Не реализован (infra готова: business_connections table) | Phase 4 |
@@ -1099,6 +1100,7 @@ def test_consolidate_doesnt_corrupt_vectors():
 | Phase 2: Deal linking | Не было | ⚠️ Частично (entity expansion показывает deal, но нет auto-linking) |
 | Phase 2: Entity expansion | Не было | ✅ Реализован (NEW — не было в плане) |
 | Phase 3: Daemon mode | Не было | ✅ Реализован (brain_wrapper) |
-| Phase 3: Response engine | Не было | ❌ Не реализован |
+| Phase 3: Response engine | Не было | ❌ Не реализован (← запись до сессии 14:50) |
+| Phase 3: Response engine v2 | Не было | ✅ Реализован: combined classify+route, fact-based response (11 SQL intents), escalation с timers + night mode, progress check-in LLM, follow-up detection, ResponseGuard anti-loop, proactive owner alerts + client reminders + progress check-in. Файлы: response_engine.py, fact_queries.py, notifier.py, proactive.py |
 | Phase 3: Digest delivery | Не было | ⚠️ Генерация есть, отправки в Telegram нет |
 | Phase 3: Logging | Не было | ✅ Реализован |

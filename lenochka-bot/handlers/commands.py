@@ -213,9 +213,9 @@ async def on_direct_message(message: Message, pipeline, brain=None,
             task = _get_task_by_id(task_id, settings.db_path)
             if task and brain and brain.is_ready():
                 from services.response_engine import (
-                    parse_progress_reply_llm, format_progress_confirmation,
+                    parse_progress_reply, format_progress_confirmation,
                 )
-                decision = parse_progress_reply_llm(message.text, task, brain)
+                decision = parse_progress_reply(message.text, task, brain)
                 result = _apply_progress_update(task_id, decision, settings.db_path)
                 if result:
                     await message.answer(result)

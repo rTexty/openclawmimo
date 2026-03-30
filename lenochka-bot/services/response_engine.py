@@ -141,8 +141,8 @@ def classify_and_route_batch(texts: list[str], chat_contexts: list[str],
             if result:
                 data = brain._extract_json(result)
                 if isinstance(data, list):
-                    if len(data) == len(texts):
-                        return _normalize_decisions(data)
+                    if len(data) >= len(texts):
+                        return _normalize_decisions(data[:len(texts)])
                     if 0 < len(data) < len(texts):
                         return _normalize_decisions(data) + _fallback_decisions(
                             texts[len(data):], "partial LLM response"
@@ -180,12 +180,18 @@ def _default_decision() -> dict:
 
 
 def _fallback_decisions(texts: list[str], reason: str) -> list[dict]:
-    from .brain_wrapper import BrainWrapper
     decisions = []
+    try:
+        from brain import _classify_heuristic
+    except Exception:
+        _classify_heuristic = None
+
     for t in texts:
         try:
-            from brain import _classify_heuristic
-            label, conf, _ = _classify_heuristic(t)
+            if _classify_heuristic:
+                label, conf, _ = _classify_heuristic(t)
+            else:
+                label, conf = "other", 0.3
         except Exception:
             label, conf = "other", 0.3
         decisions.append({
@@ -200,6 +206,58 @@ def _fallback_decisions(texts: list[str], reason: str) -> list[dict]:
 # =========================================================
 # 3. FACT RESPONSE GENERATION
 # =========================================================
+
+# --- Templates for simple fact responses (без LLM, $0 cost) ---
+
+FACT_TEMPLATES = {
+    "deadline": (
+        "По срокам:\n{facts}"
+    ),
+    "status": (
+        "Текущий статус:\n{facts}"
+    ),
+    "amount": (
+        "{facts}"
+    ),
+    "payment_status": (
+        "По оплате:\n{facts}"
+    ),
+    "overdue": (
+        "Просрочено:\n{facts}"
+    ),
+    "tasks_today": (
+        "Задачи на сегодня:\n{facts}"
+    ),
+    "active_leads": (
+        "Активные лиды:\n{facts}"
+    ),
+    "deal_details": (
+        "{facts}"
+    ),
+    "contact_history": (
+        "История общения:\n{facts}"
+    ),
+    "last_interaction": (
+        "{facts}"
+    ),
+    "context_recall": (
+        "Контекст:\n{facts}"
+    ),
+}
+
+
+def generate_fact_response_with_template(intent: str, facts: str) -> str | None:
+    """
+    Template-based response без LLM. Бесплатно.
+    Возвращает None если нет шаблона для этого intent.
+    """
+    template = FACT_TEMPLATES.get(intent)
+    if not template:
+        return None
+    if not facts:
+        return None
+    return template.format(facts=facts)
+
 
 RESPONSE_GEN_SYSTEM = """Ты — Lenochka, AI-ассистент владельца бизнеса.
 Клиент задал вопрос. У тебя есть факты из CRM.

@@ -183,6 +183,78 @@ def store(content, mem_type="episodic", importance=0.5, contact_id=None,
 
 # === RECALL (Search) ===
 
+def _rrf_rank(results: list[dict], limit: int, k: int = 60) -> list[dict]:
+    """
+    Reciprocal Rank Fusion — нормализует скоры из разных источников.
+    
+    Проблема: vector scores 0-1, BM25 ranks -10..0, keyword scores arbitrary.
+    RRF решает: ранжирует по позиции в каждом списке, не по абсолютному скору.
+    
+    Formula: RRF_score(item) = sum(1 / (k + rank_in_source + 1))
+    k=60 — стандартная константа (устойчива к выбросам).
+    """
+    # Группируем по source
+    by_source: dict[str, list[dict]] = {}
+    for r in results:
+        src = r.get("source", "unknown")
+        by_source.setdefault(src, []).append(r)
+
+    # Сортируем каждый source по его native score (descending)
+    for src, items in by_source.items():
+        items.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # RRF: для каждого item считаем сумму 1/(k+rank+1) по всем source
+    rrf_scores: dict[tuple, float] = {}
+    item_map: dict[tuple, dict] = {}
+
+    for src, items in by_source.items():
+        for rank, item in enumerate(items):
+            key = (src, item["id"])
+            item_map[key] = item
+            # Также ищем этот item в других sources по id (cross-source match)
+            for other_src, other_items in by_source.items():
+                if other_src == src:
+                    continue
+                for other_rank, other_item in enumerate(other_items):
+                    if other_item["id"] == item["id"]:
+                        # Same item in different source — combine ranks
+                        key = _item_key(item)
+                        rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (k + rank + 1)
+                        rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (k + other_rank + 1)
+                        item_map[key] = item
+                        break
+                else:
+                    continue
+                break
+            else:
+                # Item only in this source
+                key = _item_key(item)
+                rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (k + rank + 1)
+                item_map[key] = item
+
+    # Sort by RRF score
+    sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
+
+    result = []
+    seen = set()
+    for key in sorted_keys:
+        item = item_map[key]
+        item_id = (item.get("source", ""), item["id"])
+        if item_id not in seen:
+            seen.add(item_id)
+            item["score"] = round(rrf_scores[key], 6)
+            item["rrf_applied"] = True
+            result.append(item)
+        if len(result) >= limit:
+            break
+
+    return result
+
+
+def _item_key(item: dict) -> tuple:
+    """Уникальный ключ для item (для RRF dedup)."""
+    return (item.get("source", ""), item["id"])
+
 def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
            mem_type=None, limit=20):
     """
@@ -275,7 +347,7 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
                 "score": score, "source": "agent_memory",
             })
 
-    # Dedup + sort (conn открыт — entity expansion ниже его использует)
+    # Dedup + sort
     seen = set()
     unique = []
     for r in results:
@@ -284,7 +356,11 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
             seen.add(key)
             unique.append(r)
 
-    unique.sort(key=lambda x: x.get("score", 0), reverse=True)
+    if strategy == "hybrid" and len(unique) > limit:
+        # RRF (Reciprocal Rank Fusion) для cross-source re-ranking
+        unique = _rrf_rank(unique, limit)
+    else:
+        unique.sort(key=lambda x: x.get("score", 0), reverse=True)
 
     # Entity-aware expansion: расширяем контекст по FK-связям
     # Передаём существующий conn (одно соединение на весь recall)

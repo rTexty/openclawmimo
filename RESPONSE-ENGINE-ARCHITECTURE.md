@@ -2609,3 +2609,75 @@ Follow-up detection (только business-типы, ~30%):
 | 17 | Expanded fact queries (10+ интентов) | payment_status, overdue, tasks_today, leads, deal_details, etc. |
 | 18 | Combined classify+route = primary | Один LLM-вызов вместо двух, -90% cost |
 | 19 | ResponseGuard: anti-loop + anti-spam | max 3 consecutive + 3min interval + 15min cooldown |
+
+---
+
+## 12. IMPLEMENTATION STATUS (сессия 2026-03-30 14:50 — 15:07 GMT+8)
+
+> Проведён полный аудит: каждый компонент архитектуры (секции 1-11) проверен на наличие в коде, корректность реализации и соответствие спецификации.
+
+### Статус компонентов
+
+| # | Компонент | Секция архитектуры | Статус | Файл | Комментарий |
+|---|-----------|-------------------|--------|------|-------------|
+| 1 | Combined classify+route | 9.8.4 | ✅ | response_engine.py | `classify_and_route_batch()` + COMBINED_SYSTEM prompt. Один LLM-вызов на батч. Primary path (не optimization). |
+| 2 | Fact response generation | 2.4 | ✅ | response_engine.py | `generate_fact_response()` + RESPONSE_GEN_SYSTEM prompt. LLM формулирует ответ из SQL-фактов. |
+| 3 | Escalation engine | 3 | ✅ | notifier.py | `handle_escalation()` + ESCALATION_DELAY (complaint=10мин, остальные=30мин) + night mode (23-08 → delay до 08:00) |
+| 4 | Dialog ended detection | 4 | ✅ | response_engine.py | `fast_dialog_ended()` (16 точных фраз) + `fast_sticker_ended()` (👍🤝✅👌👊💯). Бесплатно, без LLM. |
+| 5 | Follow-up detection | 9.8.1 | ✅ | response_engine.py | `detect_followups()` + FOLLOWUP_DETECT_SYSTEM prompt. LLM ищет implicit obligations. Создаёт tasks. |
+| 6 | Progress check-in reply | 9.3 | ✅ | response_engine.py | `parse_progress_reply()` + PROGRESS_REPLY_SYSTEM prompt. LLM понимает ответ owner'а (9 actions: done/in_progress/extend/blocked/cancel/remind_tomorrow/remind_date/escalate/update) |
+| 7 | ResponseGuard | 9.8.5 | ✅ | response_engine.py | min_interval=180s, max_consecutive=3, cooldown=900s. Global instance `response_guard`. |
+| 8 | Fact queries (11 intents) | 9.8.3 | ✅ | fact_queries.py | deadline, status, amount, context_recall, payment_status, overdue, tasks_today, active_leads, deal_details, contact_history, last_interaction |
+| 9 | Proactive owner alerts | 9.1 | ✅ | proactive.py | `send_owner_alerts()` — tasks(2д), agreements(3д), deals(3д), invoices(2д). Dedup через pending_notifications. |
+| 10 | Proactive client reminders | 9.2 | ✅ | proactive.py | `send_client_reminders()` — invoices, agreements, client-facing tasks. Через business API. Fallback на owner. |
+| 11 | Progress check-in proactive | 9.3 | ✅ | proactive.py | `send_progress_checkins()` — задачи due в 1-5 дней, не проверяли >2 дня. Scheduler: 10:00 GMT+8. |
+| 12 | Pending notifications | 9.8.2 | ✅ | notifier.py + init.sql | Таблица `pending_notifications`. CRUD: `_save_pending`, `_get_notification`, `_mark_sent`, `_cancel`. |
+| 13 | Startup recovery | 9.8.2 | ✅ | notifier.py | `recover_pending_notifications()` — при старте бота: просроченные → отправить, будущие → запланировать. |
+| 14 | Scheduler integration | 9.4 | ✅ | scheduler.py | 6 cron jobs в Asia/Shanghai timezone |
+| 15 | Pipeline integration | 7.2 | ✅ | pipeline.py | Phase 4 в _process_batch: combined classify+route → fact response / escalation |
+| 16 | Escalation notification format | 3.3 | ✅ | response_engine.py | 6 templates: pricing, proposal, contract, meeting, complaint, other |
+
+### Bugs found and fixed (сессия 14:50)
+
+| # | Severity | Где | Проблема | Исправление |
+|---|----------|-----|---------|-------------|
+| 1 | 🔴 Critical | commands.py:216, proactive.py:14 | `parse_progress_reply_llm` не существует. Реальное имя: `parse_progress_reply`. ImportError при каждом progress reply. | Переименованы импорты и вызовы |
+| 2 | 🟡 Serious | brain_wrapper.py | BrainWrapper не имеет `_extract_json` и `_call_llm`. Работало за счёт утечки namespace модуля brain. | Добавлены `self._extract_json = brain._extract_json` и `self._call_llm = brain._call_llm` |
+| 3 | 🟢 Minor | proactive.py:14 | Unused imports: `parse_progress_reply_llm`, `format_progress_confirmation` | Импорт удалён |
+| 4 | 🟢 Minor | response_engine.py:183-187 | `_fallback_decisions`: unused import `BrainWrapper` + `_classify_heuristic` импортировался в цикле | Unused import удалён, moved outside loop |
+| 5 | 🟢 Minor | response_engine.py:137 | `classify_and_route_batch`: не обрабатывал `len(data) > len(texts)` (отбрасывал все LLM результаты) | Добавлено `data[:len(texts)]` |
+
+### Scheduler (расписание GMT+8)
+
+| Время | Job | Описание |
+|-------|-----|----------|
+| 03:00 | consolidate | Decay + merge + RAPTOR + cleanup |
+| 08:00 | daily_digest | Утренний дайджест owner'у |
+| 08:30 | proactive_owner | Tasks/agreements/deals/invoices due soon |
+| 09:00 | proactive_client | Client obligations reminders via business API |
+| 10:00 | progress_checkin | Task progress confirmation from owner |
+| */4h | abandoned_check | Брошенные диалоги |
+| Sun 18:00 | weekly_report | Недельный отчёт |
+
+### Cost analysis (actual)
+
+```
+Per message (average):
+  Combined classify+route (batch 10): 0.1 LLM calls × $0.001 = $0.0001
+  Fact response generation (40%):     0.4 LLM calls × $0.001 = $0.0004
+  Follow-up detection (30%):          0.3 LLM calls × $0.0005 = $0.00015
+  Progress reply (rare):              ~0.01 LLM calls × $0.001 = $0.00001
+  ─────────────────────────────────────────────────────────────
+  Total per message: ~$0.00065
+  At 500 msg/day: $0.33/day = ~$10/month
+```
+
+### Что НЕ реализовано (gap analysis)
+
+| Компонент | Статус | Причина |
+|-----------|--------|---------|
+| Batch response decision | ❌ | Combined prompt работает только для classify. Response decision — per-message в pipeline. |
+| Aggregate notifications | ❌ | Несколько pending для одного чата → несколько сообщений owner'у. Нет агрегации. |
+| Template-based fact response | ❌ | Все fact response через LLM (Step 3). Для простых случаев (deadline + данные есть) можно шаблон без LLM. |
+| RRF (Reciprocal Rank Fusion) | ❌ | Recall использует простую конкатенацию скоров. Нет нормализации cross-source. |
+| Anti-spam per chat (fact response) | ⚠️ | ResponseGuard есть, но integration с _handle_fact_response не протестирована в production.

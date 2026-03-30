@@ -34,6 +34,8 @@ class BrainWrapper:
         self._generate_weekly_digest = None
         self._consolidate = None
         self._similarity = None
+        self._extract_json = None
+        self._call_llm = None
         self._initialized = False
         self.db_path: Path = _BRAIN_DIR / "db" / "lenochka.db"
 
@@ -58,6 +60,8 @@ class BrainWrapper:
         self._generate_weekly_digest = brain.generate_weekly_digest
         self._consolidate = mem.consolidate
         self._similarity = brain.similarity
+        self._extract_json = brain._extract_json
+        self._call_llm = brain._call_llm
         self.db_path = mem.DB_PATH
         self._initialized = True
 

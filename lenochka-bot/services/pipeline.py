@@ -344,9 +344,10 @@ class PipelineProcessor:
         )
 
     async def _handle_fact_response(self, item: PipelineItem, decision: dict):
-        """Ответить клиенту фактами из БД."""
+        """Ответить клиенту фактами из БД. Template first, LLM fallback."""
         from services.response_engine import (
-            response_guard, generate_fact_response, fast_dialog_ended,
+            response_guard, generate_fact_response, generate_fact_response_with_template,
+            fast_dialog_ended,
         )
         from services.fact_queries import query_fact
 
@@ -375,13 +376,15 @@ class PipelineProcessor:
             await self._handle_escalation(item, decision)
             return
 
-        # Generate natural response
-        contact_name = _get_contact_name_sync(item.contact_id, self.db_path)
-        response_text = await asyncio.to_thread(
-            generate_fact_response,
-            item.normalized.text if item.normalized else "",
-            facts, contact_name, self.brain
-        )
+        # Template first ($0 cost), LLM fallback
+        response_text = generate_fact_response_with_template(intent, facts)
+        if not response_text:
+            contact_name = _get_contact_name_sync(item.contact_id, self.db_path)
+            response_text = await asyncio.to_thread(
+                generate_fact_response,
+                item.normalized.text if item.normalized else "",
+                facts, contact_name, self.brain
+            )
 
         if not response_text:
             await self._handle_escalation(item, decision)

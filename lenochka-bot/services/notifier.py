@@ -89,6 +89,14 @@ async def _check_and_notify_later(bot, notif_id: int, item, decision: dict,
     if not row or row["status"] != "pending":
         return
 
+    # Проверяем: owner уже ответил в этом чате? → отмена
+    from services.dialog_state import get_dialog_state
+    state = get_dialog_state(item.chat_thread_id, item.message_id, db_path)
+    if state["owner_replied_after"]:
+        _cancel(notif_id, db_path)
+        logger.info(f"Escalation cancelled (owner replied): notif_id={notif_id}")
+        return
+
     # Owner не ответил → notify
     contact_name = _get_contact_name(item.contact_id, db_path) if item.contact_id else "Клиент"
     escalation_type = decision.get("escalation_type", decision.get("intent", "other"))
@@ -117,6 +125,66 @@ async def _check_and_notify_later(bot, notif_id: int, item, decision: dict,
         logger.info(f"Escalation sent: notif_id={notif_id}, type={escalation_type}")
     except Exception as e:
         logger.error(f"Failed to send escalation: {e}")
+
+    # Aggregate: собрать другие pending для того же чата и отправить сводкой
+    await _aggregate_and_send_pending(bot, item.chat_thread_id, db_path)
+
+
+async def _aggregate_and_send_pending(bot, chat_thread_id: int | None,
+                                       db_path: str):
+    """
+    Если для одного чата есть несколько pending notifications — собрать
+    в одно сводное сообщение и отправить owner'у.
+    """
+    if not chat_thread_id:
+        return
+
+    conn = get_db(db_path)
+    try:
+        pending = conn.execute("""
+            SELECT * FROM pending_notifications
+            WHERE chat_thread_id = ? AND status = 'pending'
+              AND notify_at <= datetime('now')
+            ORDER BY created_at ASC
+            LIMIT 10
+        """, (chat_thread_id,)).fetchall()
+    finally:
+        conn.close()
+
+    if len(pending) <= 1:
+        return  # Нечего агрегировать
+
+    # Собираем сводку
+    lines = []
+    notif_ids = []
+    for p in pending:
+        notif_ids.append(p["id"])
+        etype = p.get("escalation_type", "other")
+        text_short = (p.get("message_text") or "")[:80]
+        icon = {"pricing": "💰", "proposal": "📄", "contract": "📝",
+                "meeting": "📅", "complaint": "⚠️"}.get(etype, "❓")
+        lines.append(f"{icon} «{text_short}»")
+
+    contact_name = _get_contact_name(pending[0].get("contact_id"), db_path)
+    agg_text = (
+        f"📬 <b>{contact_name}</b>: {len(pending)} сообщений ждут ответа\n\n"
+        + "\n".join(lines)
+        + f"\n\n💡 Напишите клиенту напрямую."
+    )
+
+    try:
+        from config import settings
+        await bot.send_message(
+            chat_id=settings.owner_id,
+            text=agg_text,
+            parse_mode="HTML",
+        )
+        # Mark all aggregated as sent
+        for nid in notif_ids:
+            _mark_sent(nid, db_path)
+        logger.info(f"Aggregated {len(notif_ids)} notifications for chat {chat_thread_id}")
+    except Exception as e:
+        logger.error(f"Aggregate notification failed: {e}")
 
 
 # =========================================================
