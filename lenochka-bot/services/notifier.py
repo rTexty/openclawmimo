@@ -81,7 +81,7 @@ async def handle_escalation(bot, item, decision: dict, db_path: str):
 
 async def _check_and_notify_later(bot, notif_id: int, item, decision: dict,
                                     delay: float, db_path: str):
-    """Ждём delay секунд, проверяем статус, отправляем owner'у."""
+    """Ждём delay секунд, проверяем статус, агрегируем и отправляем owner'у."""
     await asyncio.sleep(delay)
 
     # Проверяем что не отменили
@@ -97,20 +97,27 @@ async def _check_and_notify_later(bot, notif_id: int, item, decision: dict,
         logger.info(f"Escalation cancelled (owner replied): notif_id={notif_id}")
         return
 
-    # Owner не ответил → notify
-    contact_name = _get_contact_name(item.contact_id, db_path) if item.contact_id else "Клиент"
-    escalation_type = decision.get("escalation_type", decision.get("intent", "other"))
+    # Агрегируем ВСЕ pending для этого чата и отправляем ОДНО сводное сообщение
+    if item.chat_thread_id:
+        await _aggregate_and_send(bot, item.chat_thread_id, db_path)
+    else:
+        # Нет chat_thread — отправляем индивидуально
+        await _send_single_notification(bot, row, db_path)
 
-    # Собираем контекст
+
+async def _send_single_notification(bot, row: dict, db_path: str):
+    """Отправить одно уведомление owner'у."""
+    contact_name = _get_contact_name(row.get("contact_id"), db_path)
+    escalation_type = row.get("escalation_type", "other")
     context_block = _build_context_block(
-        item.chat_thread_id, item.contact_id, db_path
+        row.get("chat_thread_id"), row.get("contact_id"), db_path
     )
 
     text = format_escalation_notification(
         escalation_type=escalation_type,
         contact_name=contact_name,
-        message_text=item.normalized.text if item.normalized else "",
-        wait_time=format_duration(delay),
+        message_text=row.get("message_text", ""),
+        wait_time="(таймер истёк)",
         context_block=context_block,
     )
 
@@ -121,24 +128,17 @@ async def _check_and_notify_later(bot, notif_id: int, item, decision: dict,
             text=text,
             parse_mode="HTML",
         )
-        _mark_sent(notif_id, db_path)
-        logger.info(f"Escalation sent: notif_id={notif_id}, type={escalation_type}")
+        _mark_sent(row["id"], db_path)
+        logger.info(f"Single notification sent: id={row['id']}, type={escalation_type}")
     except Exception as e:
-        logger.error(f"Failed to send escalation: {e}")
-
-    # Aggregate: собрать другие pending для того же чата и отправить сводкой
-    await _aggregate_and_send_pending(bot, item.chat_thread_id, db_path)
+        logger.error(f"Failed to send notification: {e}")
 
 
-async def _aggregate_and_send_pending(bot, chat_thread_id: int | None,
-                                       db_path: str):
+async def _aggregate_and_send(bot, chat_thread_id: int, db_path: str):
     """
-    Если для одного чата есть несколько pending notifications — собрать
-    в одно сводное сообщение и отправить owner'у.
+    Агрегировать ВСЕ pending notifications для одного чата
+    и отправить owner'у ОДНО сводное сообщение.
     """
-    if not chat_thread_id:
-        return
-
     conn = get_db(db_path)
     try:
         pending = conn.execute("""
@@ -146,30 +146,36 @@ async def _aggregate_and_send_pending(bot, chat_thread_id: int | None,
             WHERE chat_thread_id = ? AND status = 'pending'
               AND notify_at <= datetime('now')
             ORDER BY created_at ASC
-            LIMIT 10
+            LIMIT 20
         """, (chat_thread_id,)).fetchall()
     finally:
         conn.close()
 
-    if len(pending) <= 1:
-        return  # Нечего агрегировать
+    if not pending:
+        return
 
-    # Собираем сводку
+    notif_ids = [p["id"] for p in pending]
+
+    if len(pending) == 1:
+        # Одно уведомление — отправляем как обычно
+        await _send_single_notification(bot, pending[0], db_path)
+        return
+
+    # Несколько уведомлений — агрегируем в одно сообщение
+    contact_name = _get_contact_name(pending[0].get("contact_id"), db_path)
+
     lines = []
-    notif_ids = []
     for p in pending:
-        notif_ids.append(p["id"])
         etype = p.get("escalation_type", "other")
         text_short = (p.get("message_text") or "")[:80]
         icon = {"pricing": "💰", "proposal": "📄", "contract": "📝",
-                "meeting": "📅", "complaint": "⚠️"}.get(etype, "❓")
+                "meeting": "📅", "complaint": "⚠️", "other": "❓"}.get(etype, "❓")
         lines.append(f"{icon} «{text_short}»")
 
-    contact_name = _get_contact_name(pending[0].get("contact_id"), db_path)
     agg_text = (
         f"📬 <b>{contact_name}</b>: {len(pending)} сообщений ждут ответа\n\n"
         + "\n".join(lines)
-        + f"\n\n💡 Напишите клиенту напрямую."
+        + "\n\n💡 Напишите клиенту напрямую."
     )
 
     try:
@@ -179,7 +185,6 @@ async def _aggregate_and_send_pending(bot, chat_thread_id: int | None,
             text=agg_text,
             parse_mode="HTML",
         )
-        # Mark all aggregated as sent
         for nid in notif_ids:
             _mark_sent(nid, db_path)
         logger.info(f"Aggregated {len(notif_ids)} notifications for chat {chat_thread_id}")
@@ -398,48 +403,6 @@ def _get_contact_name_sync(contact_id) -> str:
 def _build_context_block(chat_thread_id: int | None,
                           contact_id: int | None, db_path: str) -> str:
     """Собрать контекст для уведомления owner'у."""
-    parts = []
-    conn = get_db(db_path)
-    try:
-        if contact_id:
-            # Active deals
-            deals = conn.execute("""
-                SELECT amount, stage FROM deals
-                WHERE contact_id = ? AND stage NOT IN ('closed_won', 'closed_lost')
-                ORDER BY updated_at DESC LIMIT 2
-            """, (contact_id,)).fetchall()
-            for d in deals:
-                amt = f"{d['amount']:,.0f}₽" if d.get("amount") else "?"
-                parts.append(f"💰 Сделка: {amt} ({d['stage']})")
-
-            # Open tasks
-            tasks = conn.execute("""
-                SELECT description, due_at, priority FROM tasks
-                WHERE related_type = 'contact' AND related_id = ?
-                  AND status NOT IN ('done', 'cancelled')
-                ORDER BY due_at ASC LIMIT 3
-            """, (contact_id,)).fetchall()
-            for t in tasks:
-                due = f" до {t['due_at'][:10]}" if t.get("due_at") else ""
-                parts.append(f"📋 {t['description'][:50]}{due}")
-
-        # Recent messages
-        if chat_thread_id:
-            msgs = conn.execute("""
-                SELECT text, from_user_id, sent_at FROM messages
-                WHERE chat_thread_id = ?
-                  AND (meta_json IS NULL OR json_extract(meta_json, '$.deleted') IS NULL)
-                ORDER BY sent_at DESC LIMIT 3
-            """, (chat_thread_id,)).fetchall()
-            if msgs:
-                lines = []
-                for m in reversed(msgs):
-                    who = "Я" if m["from_user_id"] == "self" else "Клиент"
-                    lines.append(f"  {who}: {m['text'][:60]}")
-                parts.append("💬 Последние сообщения:\n" + "\n".join(lines))
-    except Exception:
-        pass
-    finally:
-        conn.close()
-
-    return "\n".join(parts) if parts else "нет контекста"
+    from services.response_context import build_notification_context, format_context_block
+    ctx = build_notification_context(chat_thread_id, contact_id, db_path)
+    return format_context_block(ctx)

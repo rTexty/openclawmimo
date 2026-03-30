@@ -372,91 +372,13 @@ def detect_followups(text: str, chat_context: str, brain) -> list[dict]:
 
 
 # =========================================================
-# 6. PROGRESS CHECK-IN REPLY — LLM-based
+# 6. PROGRESS CHECK-IN REPLY — delegate to progress.py
 # =========================================================
 
-PROGRESS_REPLY_SYSTEM = """Ты — помощник владельца бизнеса в CRM-системе Lenochka.
-Owner ответил на check-in сообщение о задаче. Определи что делать с задачей.
-
-Задача: {task_description}
-Дедлайн: {due_at}
-Текущий статус: {status}
-
-Ответ owner'а: {owner_reply}
-
-Определи action (один из):
-- "done" — задача выполнена
-- "in_progress" — в работе, продвигается
-- "extend" — нужно продлить срок (укажи new_date или extend_days)
-- "blocked" — заблокирована, есть препятствие
-- "cancel" — задача отменена
-- "remind_tomorrow" — напомнить завтра
-- "remind_date" — напомнить в конкретную дату
-- "escalate" — проблема, нужно вмешательство
-- "update" — просто обновление статуса, без изменения задачи
-
-Отвечай ТОЛЬКО JSON:
-{"action":"<тип>","new_date":"YYYY-MM-DD или null","extend_days":N или null,
- "notes":"<что сказал owner, кратко>","priority":"<low|normal|high|urgent или null>"}
-"""
-
-
-def parse_progress_reply(text: str, task: dict, brain) -> dict:
-    """
-    LLM понимает ответ owner'а и определяет что делать с задачей.
-    """
-    if not brain.is_ready():
-        return {"action": "update", "new_date": None, "extend_days": None,
-                "notes": text, "priority": None}
-
-    try:
-        result = brain._call_llm(
-            PROGRESS_REPLY_SYSTEM.format(
-                task_description=task.get("description", "?"),
-                due_at=task.get("due_at", "не указан"),
-                status=task.get("status", "open"),
-                owner_reply=text,
-            ),
-            "", temperature=0.0, max_tokens=300,
-        )
-        if result:
-            data = brain._extract_json(result)
-            if isinstance(data, dict) and "action" in data:
-                return data
-    except Exception as e:
-        logger.warning(f"Progress reply parse failed: {e}")
-
-    # Fallback — записать как notes
-    return {"action": "update", "new_date": None, "extend_days": None,
-            "notes": text, "priority": None}
-
-
-def format_progress_confirmation(decision: dict) -> str:
-    """Форматировать подтверждение обновления задачи."""
-    action = decision.get("action", "update")
-    notes = decision.get("notes", "")
-    suffix = f" — {notes}" if notes else ""
-
-    if action == "done":
-        return f"✅ Задача закрыта{suffix}"
-    elif action == "in_progress":
-        return f"🔨 В работе{suffix}"
-    elif action == "extend":
-        if decision.get("new_date"):
-            return f"📅 Дедлайн → {decision['new_date']}{suffix}"
-        days = decision.get("extend_days", 3)
-        return f"📅 Дедлайн продлён на {days}д{suffix}"
-    elif action == "blocked":
-        return f"⚠️ Заблокировано (urgent){suffix}"
-    elif action == "cancel":
-        return f"❌ Задача отменена{suffix}"
-    elif action == "remind_tomorrow":
-        return f"🔔 Напомню завтра"
-    elif action == "remind_date":
-        return f"🔔 Напомню {decision.get('new_date', '?')}"
-    elif action == "escalate":
-        return f"🚨 Эскалировано{suffix}"
-    return f"📝 Записал{suffix}"
+from services.progress import (
+    parse_progress_reply,
+    format_progress_confirmation,
+)
 
 
 # =========================================================

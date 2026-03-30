@@ -239,9 +239,15 @@ def _rrf_rank(results: list[dict], limit: int, k: int = 60) -> list[dict]:
     seen = set()
     for key in sorted_keys:
         item = item_map[key]
-        item_id = (item.get("source", ""), item["id"])
-        if item_id not in seen:
-            seen.add(item_id)
+        # Dedup: same memory id across agent_memory/agent_memory_fts/vector = one item
+        # CHAOS items are separate data store — keep by (source, id)
+        src = item.get("source", "")
+        if src in ("agent_memory", "agent_memory_fts", "vector"):
+            dedup_key = ("memory", item["id"])
+        else:
+            dedup_key = (src, item["id"])
+        if dedup_key not in seen:
+            seen.add(dedup_key)
             item["score"] = round(rrf_scores[key], 6)
             item["rrf_applied"] = True
             result.append(item)
@@ -252,8 +258,15 @@ def _rrf_rank(results: list[dict], limit: int, k: int = 60) -> list[dict]:
 
 
 def _item_key(item: dict) -> tuple:
-    """Уникальный ключ для item (для RRF dedup)."""
-    return (item.get("source", ""), item["id"])
+    """
+    Уникальный ключ для item (для RRF dedup).
+    Agent memory sources (vector, fts, like) ссылаются на одну таблицу —
+    группируем по id без source.
+    """
+    src = item.get("source", "")
+    if src in ("agent_memory", "agent_memory_fts", "vector"):
+        return ("memory", item["id"])
+    return (src, item["id"])
 
 def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
            mem_type=None, limit=20):
@@ -313,7 +326,31 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
         except Exception as e:
             print(f"⚠️ FTS chaos search error: {e}", file=sys.stderr)
 
-    # 3. Keyword search по memories (LIKE fallback)
+    # 3. BM25 по memories FTS (trigram — лучше для кириллицы чем LIKE)
+    if strategy in ("hybrid", "bm25"):
+        try:
+            fts_query = f'"{query}"' if " " in query else query
+            rows = conn.execute("""
+                SELECT m.id, m.content, m.type, m.importance, m.strength,
+                       m.contact_id, m.created_at, rank, 'agent_memory_fts' as source
+                FROM memories_fts
+                JOIN memories m ON memories_fts.rowid = m.id
+                WHERE memories_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (fts_query, limit)).fetchall()
+            for r in rows:
+                results.append({
+                    "id": r["id"], "content": r["content"], "type": r["type"],
+                    "importance": r["importance"], "strength": r["strength"],
+                    "contact_id": r["contact_id"], "created_at": r["created_at"],
+                    "score": abs(r["rank"]) if r["rank"] else 0,
+                    "source": "agent_memory_fts",
+                })
+        except Exception as e:
+            print(f"⚠️ FTS memories search error: {e}", file=sys.stderr)
+
+    # 4. Keyword search по memories (LIKE fallback — для коротких запросов без trigram совпадений)
     if strategy in ("hybrid", "keyword"):
         sql = """
             SELECT id, content, type, importance, strength, contact_id, chat_thread_id,

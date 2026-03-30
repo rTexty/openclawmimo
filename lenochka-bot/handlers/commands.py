@@ -4,8 +4,6 @@ Command Handlers — /start, /status, /leads, /tasks, /digest, /weekly, /find, /
 Все команды защищены is_owner (инжектируется OwnerMiddleware).
 Non-owner получает приветствие и блокировку.
 """
-import re
-import sqlite3
 import logging
 from aiogram import Router, F
 from aiogram.types import Message
@@ -14,6 +12,10 @@ from aiogram.enums import ParseMode
 
 from config import settings
 from services import memory as mem
+from services.progress import (
+    extract_task_id_from_checkin, get_task_by_id, apply_progress_update,
+    format_progress_confirmation,
+)
 
 router = Router(name="commands")
 logger = logging.getLogger("lenochka.commands")
@@ -206,23 +208,21 @@ async def on_direct_message(message: Message, pipeline, brain=None,
 
     # Check: это ответ на progress check-in?
     if message.reply_to_message:
-        task_id = _extract_task_id_from_checkin(
+        task_id = extract_task_id_from_checkin(
             message.reply_to_message.text or ""
         )
         if task_id:
-            task = _get_task_by_id(task_id, settings.db_path)
+            task = get_task_by_id(task_id, settings.db_path)
             if task and brain and brain.is_ready():
-                from services.response_engine import (
-                    parse_progress_reply, format_progress_confirmation,
-                )
+                from services.progress import parse_progress_reply
                 decision = parse_progress_reply(message.text, task, brain)
-                result = _apply_progress_update(task_id, decision, settings.db_path)
+                result = apply_progress_update(task_id, decision, settings.db_path)
                 if result:
                     await message.answer(result)
                 return
             elif task:
                 await message.answer("⚠️ Brain не готов. Записал как заметку.")
-                _apply_progress_update(task_id, {"action": "update", "notes": message.text}, settings.db_path)
+                apply_progress_update(task_id, {"action": "update", "notes": message.text}, settings.db_path)
                 return
 
     # Owner написал не-команду в личку боту
@@ -232,90 +232,4 @@ async def on_direct_message(message: Message, pipeline, brain=None,
     )
 
 
-# =========================================================
-# PROGRESS CHECK-IN HELPERS
-# =========================================================
-
-def _extract_task_id_from_checkin(bot_message_text: str) -> int | None:
-    """Извлечь task_id из маркера [task:ID]."""
-    match = re.search(r'\[task:(\d+)\]', bot_message_text)
-    return int(match.group(1)) if match else None
-
-
-def _get_task_by_id(task_id: int, db_path: str) -> dict | None:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def _apply_progress_update(task_id: int, decision: dict, db_path: str) -> str:
-    """Обновить задачу на основе LLM-решения. Возвращает текст подтверждения."""
-    from services.response_engine import format_progress_confirmation
-    from datetime import datetime, timedelta, timezone
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    action = decision.get("action", "update")
-    now_note = f"[{datetime.now(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')}]"
-
-    try:
-        if action == "done":
-            conn.execute(
-                "UPDATE tasks SET status='done', updated_at=datetime('now') WHERE id=?",
-                (task_id,),
-            )
-        elif action == "in_progress":
-            conn.execute(
-                "UPDATE tasks SET status='in_progress', updated_at=datetime('now') WHERE id=?",
-                (task_id,),
-            )
-        elif action == "extend":
-            if decision.get("new_date"):
-                conn.execute(
-                    "UPDATE tasks SET due_at=?, updated_at=datetime('now') WHERE id=?",
-                    (decision["new_date"], task_id),
-                )
-            elif decision.get("extend_days"):
-                conn.execute(
-                    "UPDATE tasks SET due_at=datetime('now', ? || ' days'), updated_at=datetime('now') WHERE id=?",
-                    (str(decision["extend_days"]), task_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE tasks SET due_at=datetime('now', '+3 days'), updated_at=datetime('now') WHERE id=?",
-                    (task_id,),
-                )
-        elif action == "blocked":
-            conn.execute(
-                "UPDATE tasks SET priority='urgent', updated_at=datetime('now') WHERE id=?",
-                (task_id,),
-            )
-        elif action == "cancel":
-            conn.execute(
-                "UPDATE tasks SET status='cancelled', updated_at=datetime('now') WHERE id=?",
-                (task_id,),
-            )
-
-        if decision.get("notes"):
-            conn.execute(
-                "UPDATE tasks SET notes = COALESCE(notes || '\n', '') || ? WHERE id=?",
-                (f"{now_note} {decision['notes']}", task_id),
-            )
-
-        if decision.get("priority"):
-            conn.execute(
-                "UPDATE tasks SET priority=? WHERE id=?",
-                (decision["priority"], task_id),
-            )
-
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Progress update error: {e}")
-    finally:
-        conn.close()
-
-    return format_progress_confirmation(decision)
+# Progress helpers moved to services/progress.py

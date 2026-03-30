@@ -424,104 +424,19 @@ class PipelineProcessor:
             logger.error(f"Escalation error: {e}")
 
     def _get_chat_context(self, chat_thread_id: int) -> str:
-        """
-        Контекст последних 5 сообщений из чата для классификации.
-        
-        Архитектурное решение: контекст позволяет классифицировать
-        короткие ответы ('да', 'нет', 'ок') корректно — reply на '150к?' = decision,
-        reply на 'как дела?' = chit-chat.
-        
-        Используем chat_thread_id как FK из messages.chat_thread_id.
-        """
-        if not chat_thread_id:
-            return ""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                """SELECT text, from_user_id, sent_at FROM messages
-                   WHERE chat_thread_id = ? AND (meta_json IS NULL OR json_extract(meta_json, '$.deleted') IS NULL)
-                   ORDER BY sent_at DESC LIMIT 5""",
-                (chat_thread_id,),
-            ).fetchall()
-        except Exception:
-            return ""
-        finally:
-            conn.close()
-
-        if not rows:
-            return ""
-
-        lines = []
-        for r in reversed(rows):
-            author = "Я" if r["from_user_id"] == "self" else "Клиент"
-            text = r["text"][:100] if r["text"] else ""
-            lines.append(f"[{author}: {text}]")
-        return " ".join(lines)
+        """Контекст последних 5 сообщений из чата для классификации."""
+        from services.response_context import build_chat_context
+        return build_chat_context(chat_thread_id, self.db_path)
 
     def _enrich_extract_context(self, chat_ctx: str,
                                 contact_id: int | None,
                                 chat_thread_id: int | None) -> str:
         """
         Обогатить контекст для extract_entities.
-        Добавляет существующую информацию о контакте, сделках и задачах,
-        чтобы LLM корректно извлекал сущности (не дублировал, не терял связь).
+        Добавляет существующую информацию о контакте, сделках и задачах.
         """
-        parts = [chat_ctx] if chat_ctx else []
-
-        if not contact_id:
-            return " ".join(parts)
-
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            # Contact info
-            contact = conn.execute(
-                "SELECT name, tg_username, company_id FROM contacts WHERE id = ?",
-                (contact_id,),
-            ).fetchone()
-            if contact:
-                info = f"Контакт: {contact['name']}"
-                if contact["tg_username"]:
-                    info += f" (@{contact['tg_username']})"
-                if contact["company_id"]:
-                    comp = conn.execute(
-                        "SELECT name FROM companies WHERE id = ?",
-                        (contact["company_id"],),
-                    ).fetchone()
-                    if comp:
-                        info += f", {comp['name']}"
-                parts.append(info)
-
-            # Active deals
-            deals = conn.execute(
-                """SELECT amount, stage FROM deals
-                   WHERE contact_id = ? AND stage NOT IN ('closed_won', 'closed_lost')
-                   ORDER BY created_at DESC LIMIT 3""",
-                (contact_id,),
-            ).fetchall()
-            for d in deals:
-                amt = f"{d['amount']:,.0f}₽" if d["amount"] else "сумма не указана"
-                parts.append(f"Активная сделка: {amt}, стадия: {d['stage']}")
-
-            # Open tasks
-            tasks = conn.execute(
-                """SELECT description, priority, due_at FROM tasks
-                   WHERE related_type = 'contact' AND related_id = ?
-                     AND status NOT IN ('done', 'cancelled')
-                   ORDER BY due_at ASC LIMIT 3""",
-                (contact_id,),
-            ).fetchall()
-            for t in tasks:
-                due = f" (до {t['due_at'][:10]})" if t.get("due_at") else ""
-                parts.append(f"Задача: {t['description'][:60]}{due}")
-
-        except Exception:
-            pass
-        finally:
-            conn.close()
-
-        return " | ".join(parts)
+        from services.response_context import build_crm_context
+        return build_crm_context(chat_ctx, contact_id, chat_thread_id, self.db_path)
 
     def _update_existing_memory(self, message_id: int, content: str,
                                 content_hash: str, label: str, importance: float):
