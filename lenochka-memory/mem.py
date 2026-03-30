@@ -59,7 +59,7 @@ def _load_vec(conn):
 
 
 # Current schema version — increment on every schema change
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def init():
