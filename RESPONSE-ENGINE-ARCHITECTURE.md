@@ -933,7 +933,853 @@ CREATE INDEX IF NOT EXISTS idx_pending_notify
 
 ---
 
-## 9. ОГРАНИЧЕНИЯ
+## 9. PROACTIVE ENGINE — Два предупреждения (owner + клиент)
+
+### Философия
+
+```
+Дайджест = "что произошло".     Proactive = "что НАСТУПАЕТ".
+Дайджест = ретроспектива.       Proactive = предвидение.
+Дайджест = раз в день.          Proactive = за 2-3 дня до даты.
+```
+
+Response Engine (секции 1-8) — это **reactive**: клиент спросил → бот ответил.
+Proactive Engine — это **anticipatory**: дата наступает → бот действует ДО того, как кто-то спросит.
+
+Два направления:
+1. **К owner'у** — напоминания о задачах, сделках, договорах за 2-3 дня до дедлайна
+2. **К клиенту** — напоминания об оплате, договорах, deliverables за 2-3 дня до срока
+
+---
+
+### 9.1 PROACTIVE OWNER ALERTS — Напоминания owner'у за 2-3 дня
+
+#### Что проверяем
+
+```
+Источник                    Поле              Когда напоминать
+────────────────────────    ──────────────    ──────────────────
+tasks.due_at                Дата сдачи        За 2 дня до due_at
+agreements.due_at           Дата подписания   За 3 дня до due_at
+deals.expected_close_at     Дата закрытия     За 3 дня до close_at
+invoices.due_at             Дата оплаты       За 2 дня до due_at
+```
+
+#### Логика
+
+```
+Каждый день в 08:00 GMT+8 (вместе с дайджестом):
+│
+├─ SELECT tasks WHERE due_at BETWEEN now AND now+2days
+│  AND status NOT IN ('done', 'cancelled')
+│  AND id NOT IN (SELECT entity_id FROM pending_notifications
+│                 WHERE type='owner_task_due' AND status='sent'
+│                 AND created_at > now-3days)
+│  → Для каждой: создать pending_notification + отправить owner'у
+│
+├─ SELECT agreements WHERE due_at BETWEEN now AND now+3days
+│  AND status NOT IN ('signed', 'completed', 'cancelled')
+│  → То же самое
+│
+├─ SELECT deals WHERE expected_close_at BETWEEN now AND now+3days
+│  AND stage NOT IN ('closed_won', 'closed_lost')
+│  → То же самое
+│
+└─ SELECT invoices WHERE due_at BETWEEN now AND now+2days
+   AND status NOT IN ('paid', 'cancelled')
+   → То же самое
+```
+
+#### Dedup
+
+Каждое напоминание отправляется ОДИН раз за цикл. Храним в `pending_notifications` с `type='owner_*'` и `status='sent'`. Проверка: `WHERE entity_id=? AND type=? AND created_at > now - 3 days`. Если уже отправлено — пропускаем.
+
+Повтор: напоминание за 3 дня, потом в дайджесте за 1 день, потом в дайджесте «просрочено». Три точки касания.
+
+#### Шаблоны уведомлений owner'у
+
+```python
+PROACTIVE_OWNER_TEMPLATES = {
+    "task_due": """📋 Задача через {days_left}д: {description}
+
+👤 {contact_name}
+📅 Срок: {due_date}
+🔴 Приоритет: {priority}
+
+{context_block}""",
+
+    "agreement_due": """📝 Договор через {days_left}д: {summary}
+
+👤 {contact_name}
+💰 {amount}
+📅 Срок: {due_date}
+📌 Статус: {status}
+
+{context_block}""",
+
+    "deal_closing": """💰 Сделка закрывается через {days_left}д
+
+👤 {contact_name}
+💵 {amount} ({stage})
+📅 Ожидаемая дата: {close_at}
+
+{context_block}""",
+
+    "invoice_due": """🧾 Счёт через {days_left}д: {amount}
+
+👤 {contact_name}
+📅 Срок оплаты: {due_date}
+📌 Статус: {status}""",
+}
+```
+
+#### SQL-запросы
+
+```python
+def get_upcoming_tasks(days: int, db_path: str) -> list[dict]:
+    """Задачи с due_at в ближайшие N дней."""
+    conn = get_db(db_path)
+    rows = conn.execute("""
+        SELECT t.*, c.name as contact_name
+        FROM tasks t
+        LEFT JOIN contacts c ON t.related_type = 'contact' AND t.related_id = c.id
+        WHERE t.due_at BETWEEN datetime('now') AND datetime('now', ? || ' days')
+          AND t.status NOT IN ('done', 'cancelled')
+        ORDER BY t.due_at ASC
+    """, (str(days),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_upcoming_agreements(days: int, db_path: str) -> list[dict]:
+    """Договоры с due_at в ближайшие N дней."""
+    conn = get_db(db_path)
+    rows = conn.execute("""
+        SELECT a.*, c.name as contact_name
+        FROM agreements a
+        JOIN contacts c ON a.contact_id = c.id
+        WHERE a.due_at BETWEEN date('now') AND date('now', ? || ' days')
+          AND a.status NOT IN ('signed', 'completed', 'cancelled')
+        ORDER BY a.due_at ASC
+    """, (str(days),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_upcoming_deal_closures(days: int, db_path: str) -> list[dict]:
+    """Сделки с expected_close_at в ближайшие N дней."""
+    conn = get_db(db_path)
+    rows = conn.execute("""
+        SELECT d.*, c.name as contact_name
+        FROM deals d
+        JOIN contacts c ON d.contact_id = c.id
+        WHERE d.expected_close_at BETWEEN date('now') AND date('now', ? || ' days')
+          AND d.stage NOT IN ('closed_won', 'closed_lost')
+        ORDER BY d.expected_close_at ASC
+    """, (str(days),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_upcoming_invoices(days: int, db_path: str) -> list[dict]:
+    """Счета с due_at в ближайшие N дней."""
+    conn = get_db(db_path)
+    rows = conn.execute("""
+        SELECT i.*, a.summary as agreement_summary,
+               c.name as contact_name
+        FROM invoices i
+        JOIN agreements a ON i.agreement_id = a.id
+        JOIN contacts c ON a.contact_id = c.id
+        WHERE i.due_at BETWEEN date('now') AND date('now', ? || ' days')
+          AND i.status NOT IN ('paid', 'cancelled')
+        ORDER BY i.due_at ASC
+    """, (str(days),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+```
+
+#### Was this already sent? (Dedup)
+
+```python
+def was_proactive_sent(entity_type: str, entity_id: int,
+                       alert_type: str, db_path: str) -> bool:
+    """Проверить, отправляли ли уже это proactive-напоминание."""
+    conn = get_db(db_path)
+    row = conn.execute("""
+        SELECT id FROM pending_notifications
+        WHERE entity_type = ? AND entity_id = ?
+          AND escalation_type = ?
+          AND status = 'sent'
+          AND created_at > datetime('now', '-3 days')
+    """, (entity_type, entity_id, alert_type)).fetchone()
+    conn.close()
+    return row is not None
+```
+
+#### Интеграция в scheduler
+
+```python
+# scheduler.py — добавить в create_scheduler():
+
+# Proactive owner alerts — каждый день в 08:30 (после дайджеста)
+scheduler.add_job(
+    _proactive_owner_check,
+    CronTrigger(hour=8, minute=30, timezone="Asia/Shanghai"),
+    args=[bot, brain],
+    id="proactive_owner",
+)
+```
+
+```python
+async def _proactive_owner_check(bot, brain):
+    """Ежедневная проверка: что наступает в ближайшие 2-3 дня."""
+    from services import memory as mem
+    from services.proactive import send_owner_alerts
+    await send_owner_alerts(bot, settings.db_path)
+```
+
+---
+
+### 9.2 PROACTIVE CLIENT REMINDERS — Напоминания клиентам за 2-3 дня
+
+#### Философия
+
+Клиенту напоминаем **только о его obligations** — то, что КЛИЕНТ должен сделать:
+- Оплатить счёт
+- Подписать договор
+- Предоставить материалы
+- Подтвердить сроки
+
+НЕ напоминаем о наших внутренних задачах (это owner'у).
+
+#### Когда бот пишет клиенту
+
+```
+Сценарий                           Шаблон                      За сколько
+──────────────────────────────     ──────────────────────────   ──────────
+Счёт не оплачен                    "Напоминаем об оплате"       2 дня
+Договор не подписан                "Напоминаем о подписании"    3 дня
+Клиент обещал материалы до X       "Напоминаем о материалах"    2 дня
+Дедлайн deliverables от клиента    "Подтверждаем сроки"         3 дня
+```
+
+#### Ключевое решение: КАК бот пишет клиенту
+
+```
+Вариант A: Через business API (can_reply=True)
+  Бот пишет ОТ ИМЕНИ owner'а в тот же чат.
+  Клиент видит сообщение от Камиля, не от бота.
+  Нужно: can_reply=True в business_connections.
+
+Вариант B: Owner'у → owner пишет сам
+  Бот уведомляет owner'а: "Напомни клиенту X об оплате".
+  Owner пишет сам. Безопаснее, но owner делает работу.
+```
+
+**Рекомендация:** Вариант A (по умолчанию) с fallback на B.
+
+```
+if can_reply:
+    бот пишет клиенту через business API (от имени owner'а)
+    + уведомляет owner'а что написал
+else:
+    бот уведомляет owner'а → owner пишет сам
+```
+
+#### Логика
+
+```
+Каждый день в 09:00 GMT+8:
+│
+├─ Найти obligations клиента с due_at в ближайшие 2-3 дня
+│
+├─ Для каждой:
+│  ├─ Проверить dedup (не отправляли в последние 3 дня?)
+│  ├─ Проверить can_reply в business_connections
+│  │  ├─ can_reply=True → отправить клиенту через business API
+│  │  │  + уведомить owner'а что напомнили
+│  │  └─ can_reply=False → уведомить owner'а → owner пишет сам
+│  └─ Записать в pending_notifications (status='sent')
+│
+└─ Night mode: если 23-08 → отложить до 08:00 (для owner-alerts)
+   Для client reminders: отправлять только в 09:00-20:00 (не спамить ночью)
+```
+
+#### Что напоминаем клиенту (SQL)
+
+```python
+def get_client_obligations(days: int, db_path: str) -> list[dict]:
+    """
+    Obligations клиента — то, что КЛИЕНТ должен сделать:
+    - Оплатить счёт
+    - Подписать договор
+    - Предоставить материалы (tasks с related=client obligation)
+    """
+    conn = get_db(db_path)
+    results = []
+
+    # 1. Неоплаченные счета
+    rows = conn.execute("""
+        SELECT 'invoice' as type, i.id as entity_id,
+               i.amount, i.due_at, i.status,
+               a.summary as agreement_summary,
+               c.id as contact_id, c.name as contact_name,
+               ct.tg_chat_id
+        FROM invoices i
+        JOIN agreements a ON i.agreement_id = a.id
+        JOIN contacts c ON a.contact_id = c.id
+        LEFT JOIN chat_threads ct ON ct.contact_id = c.id
+        WHERE i.due_at BETWEEN date('now') AND date('now', ? || ' days')
+          AND i.status IN ('sent', 'overdue')
+        ORDER BY i.due_at ASC
+    """, (str(days),)).fetchall()
+    results.extend([dict(r) for r in rows])
+
+    # 2. Неподписанные договоры
+    rows = conn.execute("""
+        SELECT 'agreement' as type, a.id as entity_id,
+               a.amount, a.due_at, a.status, a.summary,
+               c.id as contact_id, c.name as contact_name,
+               ct.tg_chat_id
+        FROM agreements a
+        JOIN contacts c ON a.contact_id = c.id
+        LEFT JOIN chat_threads ct ON ct.contact_id = c.id
+        WHERE a.due_at BETWEEN date('now') AND date('now', ? || ' days')
+          AND a.status IN ('sent', 'draft')
+        ORDER BY a.due_at ASC
+    """, (str(days),)).fetchall()
+    results.extend([dict(r) for r in rows])
+
+    # 3. Tasks-обязательства клиента (помечены как client-facing)
+    #    Определяем по ключевым словам в description:
+    #    "клиент должен", "предоставить", "прислать", "подтвердить", "оплатить"
+    rows = conn.execute("""
+        SELECT 'client_task' as type, t.id as entity_id,
+               t.description, t.due_at, t.priority,
+               c.id as contact_id, c.name as contact_name,
+               ct.tg_chat_id
+        FROM tasks t
+        LEFT JOIN contacts c ON t.related_type = 'contact' AND t.related_id = c.id
+        LEFT JOIN chat_threads ct ON ct.contact_id = c.id
+        WHERE t.due_at BETWEEN datetime('now') AND datetime('now', ? || ' days')
+          AND t.status NOT IN ('done', 'cancelled')
+          AND (
+              LOWER(t.description) LIKE '%клиент должен%'
+              OR LOWER(t.description) LIKE '%предоставит%'
+              OR LOWER(t.description) LIKE '%прислал%'
+              OR LOWER(t.description) LIKE '%подтвердит%'
+              OR LOWER(t.description) LIKE '%оплат%'
+              OR LOWER(t.description) LIKE '%подписать%'
+          )
+        ORDER BY t.due_at ASC
+    """, (str(days),)).fetchall()
+    results.extend([dict(r) for r in rows])
+
+    conn.close()
+    return results
+```
+
+#### Шаблоны напоминаний клиенту
+
+```python
+CLIENT_REMINDER_TEMPLATES = {
+    "invoice": (
+        "Добрый день! 🧾\n\n"
+        "Напоминаем об оплате по договору «{agreement_summary}».\n"
+        "Сумма: {amount}\n"
+        "Срок: {due_date}\n\n"
+        "Если уже оплатили — проигнорируйте это сообщение."
+    ),
+
+    "agreement": (
+        "Добрый день! 📝\n\n"
+        "Напоминаем о подписании договора «{summary}».\n"
+        "{amount_line}"
+        "Срок: {due_date}\n\n"
+        "Если есть вопросы — напишите, поможем."
+    ),
+
+    "client_task": (
+        "Добрый день! 📋\n\n"
+        "Напоминаем: {description}\n"
+        "Срок: {due_date}\n\n"
+        "Если уже сделали — проигнорируйте."
+    ),
+}
+```
+
+#### Отправка клиенту
+
+```python
+async def send_client_reminder(bot, obligation, biz_conn_id):
+    """
+    Отправить напоминание клиенту через business API.
+    От имени owner'а (клиент видит сообщение от Камиля).
+    """
+    template = CLIENT_REMINDER_TEMPLATES.get(obligation["type"])
+    if not template:
+        return False
+
+    # Формируем текст
+    amount = f"{obligation.get('amount', 0):,.0f}₽" if obligation.get("amount") else ""
+    text = template.format(
+        agreement_summary=obligation.get("agreement_summary", ""),
+        summary=obligation.get("summary", obligation.get("description", "")),
+        amount=amount,
+        amount_line=f"Сумма: {amount}\n" if amount else "",
+        due_date=obligation.get("due_at", "")[:10],
+        description=obligation.get("description", ""),
+    )
+
+    chat_id = obligation.get("tg_chat_id")
+    if not chat_id:
+        return False
+
+    try:
+        await bot.send_message(
+            chat_id=int(chat_id),
+            text=text,
+            business_connection_id=biz_conn_id,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Client reminder failed: {e}")
+        return False
+```
+
+#### Owner notification при client reminder
+
+```python
+# Когда бот напомнил клиенту → уведомляем owner'а
+
+CLIENT_SENT_NOTIFY = """✅ Напомнил {contact_name}: {what}
+
+💬 «{reminder_text_short}»"""
+
+# Когда НЕ смог написать (can_reply=False) → просим owner'а
+
+CLIENT_FALLBACK_NOTIFY = """📋 Напомни {contact_name} — {what}
+
+📅 Срок: {due_date}
+{amount_line}
+⚠️ Не могу написать сам (нет прав на ответ). Напишите клиенту."""
+```
+
+#### Интеграция в scheduler
+
+```python
+# scheduler.py — добавить в create_scheduler():
+
+# Proactive client reminders — каждый день в 09:00
+scheduler.add_job(
+    _proactive_client_check,
+    CronTrigger(hour=9, minute=0, timezone="Asia/Shanghai"),
+    args=[bot],
+    id="proactive_client",
+)
+```
+
+```python
+async def _proactive_client_check(bot):
+    """Ежедневная проверка: obligations клиента в ближайшие 2-3 дня."""
+    from services.proactive import send_client_reminders
+    await send_client_reminders(bot, settings.db_path)
+```
+
+---
+
+### 9.3 PROGRESS CHECK-IN — Запрос подтверждения прогресса у owner'а
+
+#### Проблема
+
+Сейчас: задача создаётся → лежит в CRM → owner забывает → задача просрочена → дайджест показывает «⚠️ просрочено».
+
+Нужно: бот периодически спрашивает owner'а «как дела с задачей X?» — ДО просрочки.
+
+#### Логика
+
+```
+Каждый день в 10:00 GMT+8:
+│
+├─ Найти задачи:
+│  status='open' или 'in_progress'
+│  due_at > now (не просрочены)
+│  due_at < now + 5 дней (скоро дедлайн)
+│  last_progress_check < now - 2 дня (не спрашивали >2 дней)
+│
+├─ Owner в ночном режиме (23-08)?
+│  └─ Да → отложить до 08:00
+│
+├─ Для каждой задачи:
+│  ├─ Собрать контекст: кто contact, что за сделка, когда deadline
+│  ├─ Отправить owner'у в личку бота
+│  └─ Записать last_progress_check = now
+│
+└─ Dedup: не спрашивать одну задачу чаще раза в 2 дня
+```
+
+#### Что спрашиваем
+
+Не просто «как дела?» — а с контекстом:
+
+```
+📋 Check-in: {description}
+
+👤 Клиент: {contact_name}
+💰 Сделка: {amount} ({stage})
+📅 Дедлайн: {due_date} (осталось {days_left}д)
+📌 Статус: {status}
+
+Последнее в чате:
+{last_messages}
+
+Как дела? Напишите «готово», «в работе», или опишите статус.
+```
+
+#### Обработка ответа owner'а
+
+Owner отвечает в личку бота. Бот должен понять ответ и обновить статус задачи.
+
+```
+Owner пишет:                    Бот делает:
+─────────────────────────────   ─────────────────────────────
+"готово" / "done" / "закрыл"   → UPDATE tasks SET status='done'
+"в работе" / "делаю"           → UPDATE tasks SET status='in_progress'
+"подожди" / "отложил"          → UPDATE tasks SET due_at = now + 3 days
+"зависло" / "проблема"         → UPDATE tasks SET priority='urgent'
+                                 + добавить memory с risk-label
+"напомни завтра"               → nothing, check-in повторится завтра
+<произвольный текст>           → записать в notes задачи как progress update
+```
+
+**Важно:** это НЕ response engine (не LLM). Это простые regex + fuzzy matching на ответы owner'а. Бесплатно, мгновенно, без LLM.
+
+```python
+PROGRESS_PATTERNS = [
+    # (pattern, action, detail)
+    (r'\b(готово|done|закрыл|выполнено|сделано)\b', 'mark_done', None),
+    (r'\b(в работе|делаю|работаю|начал)\b', 'mark_in_progress', None),
+    (r'\b(подожди|отложи|перенеси|позже)\b', 'extend_deadline', 3),
+    (r'\b(зависло|проблема|блок|блокер|стоп)\b', 'mark_blocked', None),
+    (r'\b(напомни|reminder)\b.*\b(завтра|tomorrow)\b', 'remind_tomorrow', None),
+    (r'\b(напомни|reminder)\b.*\b(в понедельник)\b', 'remind_day', 'monday'),
+]
+
+def parse_progress_reply(text: str) -> tuple[str, any]:
+    """Определить намерение owner'а из ответа."""
+    text_lower = text.lower().strip()
+
+    for pattern, action, detail in PROGRESS_PATTERNS:
+        if re.search(pattern, text_lower):
+            return (action, detail)
+
+    # Нет совпадений — записать как free-text update
+    return ('update_notes', text)
+```
+
+#### Flow полного цикла
+
+```
+Day 0: Клиент пишет "сделаю КП до пятницы"
+  → extract: task "сделать КП", due_at="2026-04-04"
+  → crm_upsert: INSERT tasks
+
+Day 2 (Tuesday 10:00): proactive check-in
+  → "📋 Check-in: сделать КП для Ивана. Дедлайн через 2д. Как дела?"
+  → Owner: "в работе"
+  → UPDATE tasks SET status='in_progress'
+
+Day 3 (Wednesday 10:00): proactive check-in
+  → "📋 Check-in: сделать КП. Дедлайн завтра. Статус: in_progress."
+  → Owner: "готово"
+  → UPDATE tasks SET status='done'
+
+Day 4 (Thursday): задача done — не проверяем
+```
+
+#### Owner reply → task update SQL
+
+```python
+def apply_progress_update(task_id: int, action: str, detail,
+                           db_path: str) -> str:
+    """Обновить задачу на основе ответа owner'а."""
+    conn = get_db(db_path)
+
+    if action == 'mark_done':
+        conn.execute("""
+            UPDATE tasks SET status='done', updated_at=datetime('now')
+            WHERE id = ?
+        """, (task_id,))
+        conn.commit()
+        conn.close()
+        return "✅ Задача закрыта"
+
+    elif action == 'mark_in_progress':
+        conn.execute("""
+            UPDATE tasks SET status='in_progress', updated_at=datetime('now')
+            WHERE id = ?
+        """, (task_id,))
+        conn.commit()
+        conn.close()
+        return "🔨 Статус: в работе"
+
+    elif action == 'extend_deadline':
+        days = detail if isinstance(detail, int) else 3
+        conn.execute("""
+            UPDATE tasks
+            SET due_at = datetime('now', ? || ' days'),
+                updated_at = datetime('now')
+            WHERE id = ?
+        """, (str(days), task_id))
+        conn.commit()
+        conn.close()
+        return f"📅 Дедлайн продлён на {days} дней"
+
+    elif action == 'mark_blocked':
+        conn.execute("""
+            UPDATE tasks SET priority='urgent', updated_at=datetime('now')
+            WHERE id = ?
+        """, (task_id,))
+        conn.commit()
+        conn.close()
+        return "⚠️ Приоритет повышен до urgent"
+
+    elif action == 'update_notes':
+        conn.execute("""
+            UPDATE tasks
+            SET notes = COALESCE(notes || '\n', '') || ?
+            WHERE id = ?
+        """, (f"[{_now_gmt8().strftime('%m-%d %H:%M')}] {detail}", task_id))
+        conn.commit()
+        conn.close()
+        return "📝 Записал обновление"
+
+    conn.close()
+    return ""
+```
+
+#### Новый middleware: Progress Reply Handler
+
+Progress check-in ответы owner'а — это НЕ обычные direct messages. Owner отвечает В ОТВЕТ на сообщение бота о задаче. Нужно распознать что это ответ на check-in.
+
+```python
+# handlers/commands.py — новый обработчик:
+
+@router.message(F.chat.type == "private", F.reply_to_message)
+async def on_owner_reply_to_checkin(message: Message, is_owner: bool = False, **kwargs):
+    """
+    Owner ответил на сообщение бота в личке.
+    Проверяем: это ответ на progress check-in?
+    """
+    if not is_owner:
+        return
+
+    # Ищем в pending_notifications: было ли это сообщение бота
+    # check-in-ом по задаче?
+    original_text = message.reply_to_message.text or ""
+    task_id = _extract_task_id_from_checkin(original_text)
+
+    if task_id:
+        action, detail = parse_progress_reply(message.text)
+        result = apply_progress_update(task_id, action, detail, settings.db_path)
+        if result:
+            await message.answer(result)
+        return
+
+    # Не check-in — пропускаем (обычный reply, не наш)
+
+
+def _extract_task_id_from_checkin(bot_message_text: str) -> int | None:
+    """Извлечь task_id из шаблона check-in сообщения бота."""
+    # В шаблоне можно зашить скрытый маркер:
+    # "📋 Check-in: описание задачи [task:42]"
+    match = re.search(r'\[task:(\d+)\]', bot_message_text)
+    if match:
+        return int(match.group(1))
+    return None
+```
+
+**Решение с маркером:** в текст check-in-сообщения для owner'а добавляем невидимый маркер `[task:ID]` — он виден в raw text, но не мешает. При ответе owner'а — ищем маркер в `reply_to_message.text`.
+
+Альтернатива: хранить маппинг `bot_message_id → task_id` в отдельной таблице. Но маркер проще.
+
+#### Интеграция в scheduler
+
+```python
+# scheduler.py — добавить в create_scheduler():
+
+# Progress check-in — каждый день в 10:00
+scheduler.add_job(
+    _progress_checkin,
+    CronTrigger(hour=10, minute=0, timezone="Asia/Shanghai"),
+    args=[bot],
+    id="progress_checkin",
+)
+```
+
+```python
+async def _progress_checkin(bot):
+    """Ежедневный check-in: задачи со сроком 1-5 дней, не проверяли >2 дня."""
+    from services.proactive import send_progress_checkins
+    await send_progress_checkins(bot, settings.db_path)
+```
+
+---
+
+### 9.4 ОБЩИЙ РАСПОРЯДОК PROACTIVE CHECKS
+
+```
+Время (GMT+8)    Что                         Кому
+──────────────    ──────────────────────────   ──────────────
+08:00             Утренний дайджест            Owner (личка бота)
+08:30             Proactive owner alerts       Owner (личка бота)
+                  (задачи, договоры, сделки,
+                   счета — за 2-3 дня)
+09:00             Client reminders             Клиент (business API)
+                  (оплата, подписание,          или Owner если нет прав
+                   материалы — за 2-3 дня)
+10:00             Progress check-in            Owner (личка бота)
+                  (задачи due в 1-5 дней,
+                   не проверяли >2 дня)
+18:00 (Sunday)    Weekly report                Owner (личка бота)
+──────────────    ──────────────────────────   ──────────────
+Каждые 4ч         Abandoned dialogues          Owner (личка бота)
+03:00             Consolidate (decay+merge)    Фоновый процесс
+```
+
+#### Night mode (23:00-08:00)
+
+```
+Proactive owner alerts:  → отложить до 08:00
+Progress check-in:       → отложить до 08:00
+Client reminders:        → отправлять только 09:00-20:00
+                          (клиентам не пишем ночью)
+Дайджест:                → по расписанию (08:00)
+Complaint escalation:    → СРАЗУ, даже ночью (10 мин)
+```
+
+---
+
+### 9.5 НОВЫЕ ФАЙЛЫ
+
+```
+lenochka-bot/services/
+│
+├── proactive.py              (~350 строк) — НОВЫЙ
+│   ├── send_owner_alerts()         — проверка tasks/agreements/deals/invoices
+│   ├── send_client_reminders()     — obligations клиента → business API
+│   ├── send_progress_checkins()    — задачи due soon, check-in owner'у
+│   ├── get_upcoming_tasks()
+│   ├── get_upcoming_agreements()
+│   ├── get_upcoming_deal_closures()
+│   ├── get_upcoming_invoices()
+│   ├── get_client_obligations()
+│   ├── was_proactive_sent()        — dedup
+│   ├── send_client_reminder()      — через business API
+│   ├── format_owner_alert()        — шаблон для owner'а
+│   ├── PROACTIVE_OWNER_TEMPLATES
+│   ├── CLIENT_REMINDER_TEMPLATES
+│   └── CLIENT_SENT_NOTIFY / CLIENT_FALLBACK_NOTIFY
+│
+└── progress.py               (~150 строк) — НОВЫЙ
+    ├── parse_progress_reply()      — regex owner'а ответ → action
+    ├── apply_progress_update()     — action → SQL UPDATE tasks
+    ├── _extract_task_id_from_checkin()
+    ├── PROGRESS_PATTERNS
+    └── CHECKIN_TEMPLATE            — шаблон сообщения для owner'а
+```
+
+#### Изменения в существующих
+
+```
+lenochka-bot/services/scheduler.py
+  + _proactive_owner_check (08:30)
+  + _proactive_client_check (09:00)
+  + _progress_checkin (10:00)
+
+lenochka-bot/handlers/commands.py
+  + on_owner_reply_to_checkin — обработка ответов на progress check-in
+
+lenochka-memory/schemas/init.sql
+  + ALTER TABLE pending_notifications ADD COLUMN entity_type TEXT
+  + ALTER TABLE pending_notifications ADD COLUMN entity_id INTEGER
+  + tasks.last_progress_check DATETIME (или хранить в pending_notifications)
+```
+
+---
+
+### 9.6 COST ANALYSIS (Proactive Engine)
+
+```
+Proactive Engine = 0 LLM-вызовов.
+
+Всё на SQL + regex + шаблоны:
+├── get_upcoming_*          → SQL (бесплатно)
+├── get_client_obligations  → SQL (бесплатно)
+├── parse_progress_reply    → regex (бесплатно)
+├── apply_progress_update   → SQL (бесплатно)
+├── send_client_reminder    → Telegram API (бесплатно)
+└── format_owner_alert      → string format (бесплатно)
+
+Итого: $0/мес дополнительных расходов.
+Только Telegram API calls (free tier: 30 msg/sec).
+```
+
+---
+
+### 9.7 EDGE CASES
+
+#### Owner ответил "готово" на задачу, которую бот напомнил клиенту
+
+```
+t=09:00  Бот напомнил клиенту: "Напоминаем об оплате"
+t=09:05  Owner: "готово" (ответ на check-in другой задачи)
+→ Нет конфликта. Client reminder уже отправлен.
+→ Если клиент оплатил — owner помечает invoice как paid.
+→ Бот не напоминает повторно (dedup по entity_id + sent status).
+```
+
+#### Клиент уже оплатил, но бот напомнил
+
+```
+→ Owner должен обновить invoice.status = 'paid' когда узнает.
+→ До этого бот напомнит (ложноположительное).
+→ Решение: в шаблоне напоминания добавить "Если уже оплатили — проигнорируйте".
+→ Owner может написать боту "оплатил" → обновить invoice status.
+```
+
+#### Несколько obligations у одного клиента
+
+```
+Клиент Иван: счёт на 100к (2 дня) + договор на 50к (3 дня)
+→ Два отдельных напоминания?
+→ Лучше: одно сообщение со списком.
+→ Агрегируем obligations по contact перед отправкой.
+
+CLIENT_REMINDER_AGGREGATED = """Добрый день! 📋
+
+Напоминаем:
+{items_list}
+
+Если уже всё сделали — проигнорируйте."""
+```
+
+#### Client reminder → клиент ответил → что делать?
+
+```
+Клиент: "да, оплачу завтра"
+→ Бот НЕ отвечает (response engine решит).
+→ Если response engine: intent="chitchat" или "ended" → skip.
+→ Если response engine: intent="complaint" → escalate.
+
+Клиент: "я уже оплатил"
+→ Бот НЕ отвечает.
+→ Owner увидит в дайджесте / через ingest.
+```
+
+---
+
+## 10. ОГРАНИЧЕНИЯ
 
 ```
 Что НЕ умеет:
@@ -953,7 +1799,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_notify
 
 ---
 
-## 10. РЕШЕНИЯ
+## 11. РЕШЕНИЯ
 
 | # | Решение | Причина |
 |---|---------|---------|
@@ -967,3 +1813,6 @@ CREATE INDEX IF NOT EXISTS idx_pending_notify
 | 8 | Combined classify + routing | Один вызов вместо двух, -40% cost |
 | 9 | Pending notifications table | Персистентность при рестарте |
 | 10 | Бот пишет клиенту через business API, owner'у в личку | Чистое разделение |
+| 11 | Proactive: owner'у за 2-3 дня до даты | Не только дайджест, а персональные напоминания |
+| 12 | Proactive: клиенту за 2-3 дня до дедлайна | Через business API от имени owner'а |
+| 13 | Progress check-in: owner → подтверждение прогресса | Не ждём пока спросят, сами спрашиваем |
