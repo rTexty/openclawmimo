@@ -59,7 +59,7 @@ def _load_vec(conn):
 
 
 # Current schema version — increment on every schema change
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def init():
@@ -103,6 +103,10 @@ def _migrate_db(conn):
         # v2: content_hash в messages, tg_user_id в contacts
         _migrate_v2(conn)
 
+    if current < 4:
+        # v4: last_progress_check в tasks
+        _migrate_v4(conn)
+
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
     print(f"✅ Миграция завершена → v{SCHEMA_VERSION}")
@@ -123,6 +127,14 @@ def _migrate_v2(conn):
         conn.execute("ALTER TABLE contacts ADD COLUMN tg_user_id TEXT UNIQUE")
         print("   + contacts.tg_user_id")
     print(f"✅ БД создана: {DB_PATH}")
+
+
+def _migrate_v4(conn):
+    """v3 → v4: last_progress_check в tasks."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    if "last_progress_check" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_progress_check DATETIME")
+        print("   + tasks.last_progress_check")
 
 
 # === STORE (Capture) ===

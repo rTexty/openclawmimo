@@ -147,16 +147,23 @@ class PipelineProcessor:
         # Phase 2: COMBINED classify + route — ОДИН LLM-вызов на весь батч
         texts = [item.normalized.full_text for item in valid_items]
         chat_contexts = []
+        crm_contexts = []
 
         for item in valid_items:
             ctx = await asyncio.to_thread(
                 self._get_chat_context, item.chat_thread_id
             )
             chat_contexts.append(ctx)
+            crm_ctx = await asyncio.to_thread(
+                self._enrich_extract_context, ctx,
+                item.contact_id, item.chat_thread_id
+            )
+            crm_contexts.append(crm_ctx)
 
         from services.response_engine import classify_and_route_batch
         decisions = await asyncio.to_thread(
-            classify_and_route_batch, texts, chat_contexts, self.brain
+            classify_and_route_batch, texts, chat_contexts, self.brain,
+            crm_contexts
         )
 
         # Phase 3: Batch embed — ОДИН forward pass на весь батч
@@ -332,7 +339,20 @@ class PipelineProcessor:
         )
 
         # --- Response handling ---
-        if action == "respond_fact" and intent:
+        # Skip response если сообщение от owner'а или из группы
+        from config import settings as _settings
+        is_owner_msg = (
+            item.message.from_user and
+            item.message.from_user.id == _settings.owner_id
+        )
+        chat_type = getattr(item.message.chat, 'type', None) if item.message.chat else None
+        is_group = chat_type in ('group', 'supergroup')
+
+        if is_owner_msg:
+            pass  # Owner сам написал — не отвечаем
+        elif is_group:
+            pass  # Группа — не отвечаем без mention (TODO: mention detection)
+        elif action == "respond_fact" and intent:
             await self._handle_fact_response(item, decision)
         elif action == "escalate":
             await self._handle_escalation(item, decision)

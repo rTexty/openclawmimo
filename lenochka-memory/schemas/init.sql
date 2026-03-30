@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'done', 'cancelled')),
     priority TEXT DEFAULT 'normal' CHECK(priority IN ('low', 'normal', 'high', 'urgent')),
     source_message_id INTEGER REFERENCES messages(id),
+    last_progress_check DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );

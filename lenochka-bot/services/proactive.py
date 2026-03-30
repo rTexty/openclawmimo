@@ -96,7 +96,13 @@ async def send_owner_alerts(bot, db_path: str):
 # =========================================================
 
 async def send_client_reminders(bot, db_path: str):
-    """Напоминания клиентам об их obligations за 2-3 дня."""
+    """Напоминания клиентам об их obligations за 2-3 дня. Только 09:00-20:00."""
+    # Night mode: не спамить клиентов ночью
+    hour = datetime.now(GMT8).hour
+    if hour < 9 or hour >= 20:
+        logger.info(f"Client reminders skipped: night mode (hour={hour})")
+        return
+
     obligations = _get_client_obligations(3, db_path)
 
     # Агрегируем по contact
@@ -308,7 +314,7 @@ async def send_progress_checkins(bot, brain, db_path: str):
             conn = get_db(db_path)
             try:
                 conn.execute("""
-                    UPDATE tasks SET updated_at = datetime('now')
+                    UPDATE tasks SET last_progress_check = datetime('now')
                     WHERE id = ?
                 """, (task["id"],))
                 conn.commit()
@@ -457,7 +463,8 @@ def _get_checkin_candidates(max_days: int, min_since_check: int,
             LEFT JOIN contacts c ON t.related_type = 'contact' AND t.related_id = c.id
             WHERE t.due_at BETWEEN datetime('now') AND datetime('now', ? || ' days')
               AND t.status NOT IN ('done', 'cancelled')
-              AND (t.updated_at < datetime('now', ? || ' days') OR t.updated_at IS NULL)
+              AND (t.last_progress_check < datetime('now', ? || ' days')
+                   OR t.last_progress_check IS NULL)
             ORDER BY t.due_at ASC
             LIMIT 5
         """, (str(max_days), f"-{min_since_check}")).fetchall()
