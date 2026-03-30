@@ -1,4 +1,4 @@
-"""Scheduler — дайджесты, consolidate, abandoned check."""
+"""Scheduler — дайджесты, consolidate, abandoned, proactive checks."""
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -15,6 +15,30 @@ def create_scheduler(bot, brain) -> AsyncIOScheduler:
                     timezone="Asia/Shanghai"),
         args=[bot, brain],
         id="daily_digest",
+    )
+
+    # Proactive owner alerts — 08:30
+    scheduler.add_job(
+        _proactive_owner_check,
+        CronTrigger(hour=8, minute=30, timezone="Asia/Shanghai"),
+        args=[bot],
+        id="proactive_owner",
+    )
+
+    # Client reminders — 09:00
+    scheduler.add_job(
+        _proactive_client_check,
+        CronTrigger(hour=9, minute=0, timezone="Asia/Shanghai"),
+        args=[bot],
+        id="proactive_client",
+    )
+
+    # Progress check-in — 10:00
+    scheduler.add_job(
+        _progress_checkin,
+        CronTrigger(hour=10, minute=0, timezone="Asia/Shanghai"),
+        args=[bot, brain],
+        id="progress_checkin",
     )
 
     # Недельный — Sunday 18:00
@@ -48,6 +72,21 @@ def create_scheduler(bot, brain) -> AsyncIOScheduler:
 async def _daily_digest(bot, brain):
     from services.digest import generate_and_send_daily
     await generate_and_send_daily(bot, brain)
+
+
+async def _proactive_owner_check(bot):
+    from services.proactive import send_owner_alerts
+    await send_owner_alerts(bot, settings.db_path)
+
+
+async def _proactive_client_check(bot):
+    from services.proactive import send_client_reminders
+    await send_client_reminders(bot, settings.db_path)
+
+
+async def _progress_checkin(bot, brain):
+    from services.proactive import send_progress_checkins
+    await send_progress_checkins(bot, brain, settings.db_path)
 
 
 async def _weekly_report(bot, brain):

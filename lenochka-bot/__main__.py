@@ -62,6 +62,7 @@ async def main():
     pipeline = PipelineProcessor(
         brain=brain,
         db_path=settings.db_path,
+        bot=bot,
         batch_size=settings.pipeline_batch_size,
         batch_interval=settings.pipeline_batch_interval,
     )
@@ -101,6 +102,11 @@ async def _run_polling(bot, dp, pipeline, scheduler, allowed_updates):
     async def on_startup(**kwargs):
         await pipeline.start()
         scheduler.start()
+
+        # Startup recovery: восстановить pending notifications
+        from services.notifier import recover_pending_notifications
+        await recover_pending_notifications(bot, settings.db_path)
+
         logger.info("Lenochka started (polling) ✓")
 
     async def on_shutdown(**kwargs):
@@ -166,6 +172,10 @@ async def _run_webhook(bot, dp, brain, pipeline, scheduler, allowed_updates):
     async def on_startup(app_instance):
         await pipeline.start()
         scheduler.start()
+
+        # Startup recovery: восстановить pending notifications
+        from services.notifier import recover_pending_notifications
+        await recover_pending_notifications(bot, settings.db_path)
 
         # Устанавливаем webhook в Telegram
         webhook_info = await bot.get_webhook_info()

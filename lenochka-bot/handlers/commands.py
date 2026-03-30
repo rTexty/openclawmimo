@@ -4,6 +4,8 @@ Command Handlers — /start, /status, /leads, /tasks, /digest, /weekly, /find, /
 Все команды защищены is_owner (инжектируется OwnerMiddleware).
 Non-owner получает приветствие и блокировку.
 """
+import re
+import sqlite3
 import logging
 from aiogram import Router, F
 from aiogram.types import Message
@@ -189,24 +191,131 @@ async def cmd_help(message: Message, is_owner: bool = False, **kwargs):
 
 # Direct non-command messages — ingest too
 @router.message(F.chat.type == "private")
-async def on_direct_message(message: Message, pipeline, is_owner: bool = False, **kwargs):
+async def on_direct_message(message: Message, pipeline, brain=None,
+                            is_owner: bool = False, **kwargs):
     """
     Прямые сообщения боту (не команды).
-    
-    Если owner — НЕ пишем в CRM pipeline (это не переписка с клиентом,
-    а управление ботом). Вместо этого — подсказка или обработка в будущем
-    (response engine).
-    
-    Если не owner — приветствие.
+
+    Если owner ответил reply на check-in сообщение → обработать прогресс.
+    Если owner написал не-команду → подсказка.
+    Если не owner → приветствие.
     """
     if not is_owner:
         await message.answer("👋 Привет! Я Lenochka — AI-ассистент. Пока я работаю только для своего владельца.")
         return
 
+    # Check: это ответ на progress check-in?
+    if message.reply_to_message:
+        task_id = _extract_task_id_from_checkin(
+            message.reply_to_message.text or ""
+        )
+        if task_id:
+            task = _get_task_by_id(task_id, settings.db_path)
+            if task and brain and brain.is_ready():
+                from services.response_engine import (
+                    parse_progress_reply_llm, format_progress_confirmation,
+                )
+                decision = parse_progress_reply_llm(message.text, task, brain)
+                result = _apply_progress_update(task_id, decision, settings.db_path)
+                if result:
+                    await message.answer(result)
+                return
+            elif task:
+                await message.answer("⚠️ Brain не готов. Записал как заметку.")
+                _apply_progress_update(task_id, {"action": "update", "notes": message.text}, settings.db_path)
+                return
+
     # Owner написал не-команду в личку боту
-    # НЕ ingest в pipeline — это засоряет CRM данными, которые не являются перепиской с клиентом
-    # В будущем здесь будет response engine (LLM-ответ от имени бота)
     await message.answer(
         "💡 Пиши команды: /status, /leads, /tasks, /digest, /find <запрос>\n"
         "Или просто живи в Telegram — я анализирую переписки автоматически."
     )
+
+
+# =========================================================
+# PROGRESS CHECK-IN HELPERS
+# =========================================================
+
+def _extract_task_id_from_checkin(bot_message_text: str) -> int | None:
+    """Извлечь task_id из маркера [task:ID]."""
+    match = re.search(r'\[task:(\d+)\]', bot_message_text)
+    return int(match.group(1)) if match else None
+
+
+def _get_task_by_id(task_id: int, db_path: str) -> dict | None:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _apply_progress_update(task_id: int, decision: dict, db_path: str) -> str:
+    """Обновить задачу на основе LLM-решения. Возвращает текст подтверждения."""
+    from services.response_engine import format_progress_confirmation
+    from datetime import datetime, timedelta, timezone
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    action = decision.get("action", "update")
+    now_note = f"[{datetime.now(timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')}]"
+
+    try:
+        if action == "done":
+            conn.execute(
+                "UPDATE tasks SET status='done', updated_at=datetime('now') WHERE id=?",
+                (task_id,),
+            )
+        elif action == "in_progress":
+            conn.execute(
+                "UPDATE tasks SET status='in_progress', updated_at=datetime('now') WHERE id=?",
+                (task_id,),
+            )
+        elif action == "extend":
+            if decision.get("new_date"):
+                conn.execute(
+                    "UPDATE tasks SET due_at=?, updated_at=datetime('now') WHERE id=?",
+                    (decision["new_date"], task_id),
+                )
+            elif decision.get("extend_days"):
+                conn.execute(
+                    "UPDATE tasks SET due_at=datetime('now', ? || ' days'), updated_at=datetime('now') WHERE id=?",
+                    (str(decision["extend_days"]), task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET due_at=datetime('now', '+3 days'), updated_at=datetime('now') WHERE id=?",
+                    (task_id,),
+                )
+        elif action == "blocked":
+            conn.execute(
+                "UPDATE tasks SET priority='urgent', updated_at=datetime('now') WHERE id=?",
+                (task_id,),
+            )
+        elif action == "cancel":
+            conn.execute(
+                "UPDATE tasks SET status='cancelled', updated_at=datetime('now') WHERE id=?",
+                (task_id,),
+            )
+
+        if decision.get("notes"):
+            conn.execute(
+                "UPDATE tasks SET notes = COALESCE(notes || '\n', '') || ? WHERE id=?",
+                (f"{now_note} {decision['notes']}", task_id),
+            )
+
+        if decision.get("priority"):
+            conn.execute(
+                "UPDATE tasks SET priority=? WHERE id=?",
+                (decision["priority"], task_id),
+            )
+
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Progress update error: {e}")
+    finally:
+        conn.close()
+
+    return format_progress_confirmation(decision)

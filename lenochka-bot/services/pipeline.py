@@ -49,10 +49,11 @@ class PipelineProcessor:
     8. store memories + CHAOS + CRM (sync, SQL)
     """
 
-    def __init__(self, brain, db_path: str, batch_size: int = 10,
-                 batch_interval: float = 3.0):
+    def __init__(self, brain, db_path: str, bot=None,
+                 batch_size: int = 10, batch_interval: float = 3.0):
         self.brain = brain
         self.db_path = db_path
+        self.bot = bot
         self.batch_size = batch_size
         self.batch_interval = batch_interval
         self.queue: asyncio.Queue[PipelineItem] = asyncio.Queue()
@@ -574,3 +575,83 @@ class PipelineProcessor:
             conn.commit()
         finally:
             conn.close()
+
+
+# =========================================================
+# MODULE-LEVEL HELPERS (для response handling)
+# =========================================================
+
+def _get_contact_name_sync(contact_id: int | None, db_path: str) -> str:
+    if not contact_id:
+        return "Клиент"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT name FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+        return row["name"] if row else "Клиент"
+    finally:
+        conn.close()
+
+
+def _get_active_biz_connection(db_path: str) -> str | None:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("""
+            SELECT connection_id FROM business_connections
+            WHERE status = 'active' AND can_reply = 1
+            ORDER BY connected_at DESC LIMIT 1
+        """).fetchone()
+        return row["connection_id"] if row else None
+    finally:
+        conn.close()
+
+
+def _get_tg_chat_id(chat_thread_id: int | None, db_path: str) -> str | None:
+    if not chat_thread_id:
+        return None
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT tg_chat_id FROM chat_threads WHERE id = ?", (chat_thread_id,)
+        ).fetchone()
+        return row["tg_chat_id"] if row else None
+    finally:
+        conn.close()
+
+
+def _create_followup_task(fu: dict, contact_id: int | None,
+                           chat_thread_id: int | None,
+                           message_id: int | None, db_path: str):
+    """Создать task из follow-up obligation."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Проверяем дедуп: нет ли уже такой задачи
+        existing = conn.execute("""
+            SELECT id FROM tasks
+            WHERE description LIKE ? AND related_id = ?
+              AND status NOT IN ('done', 'cancelled')
+        """, (f"%{fu.get('obligation', '')[:30]}%", contact_id)).fetchone()
+
+        if existing:
+            return
+
+        conn.execute("""
+            INSERT INTO tasks (description, related_type, related_id, due_at,
+                               priority, source_message_id)
+            VALUES (?, ?, ?, ?, 'normal', ?)
+        """, (
+            fu.get("obligation", "Follow-up"),
+            "contact" if contact_id else "other",
+            contact_id,
+            fu.get("due_date"),
+            message_id,
+        ))
+        conn.commit()
+        logger.info(f"Follow-up task created: {fu.get('obligation', '?')[:40]}")
+    except Exception as e:
+        logger.error(f"Create follow-up task error: {e}")
+    finally:
+        conn.close()
