@@ -1,40 +1,38 @@
-# TOOLS.md - Local Notes
+# TOOLS.md — Локальные заметки
 
-Skills define _how_ tools work. This file is for _your_ specifics — the stuff that's unique to your setup.
+## Database
 
-## What Goes Here
+- Путь: `/root/.openclaw/workspace/lenochka-memory/db/lenochka.db`
+- Schema: `/root/.openclaw/workspace/lenochka-memory/schemas/init.sql`
+- Версия схемы: v4 (PRAGMA user_version = 4)
 
-Things like:
+## Skills (как вызывать)
 
-- Camera names and locations
-- SSH hosts and aliases
-- Preferred voices for TTS
-- Speaker/room names
-- Device nicknames
-- Anything environment-specific
-
-## Examples
-
-```markdown
-### Cameras
-
-- living-room → Main area, 180° wide angle
-- front-door → Entrance, motion-triggered
-
-### SSH
-
-- home-server → 192.168.1.100, user: admin
-
-### TTS
-
-- Preferred voice: "Nova" (warm, slightly British)
-- Default speaker: Kitchen HomePod
+### lenochka-memory
+```bash
+python3 /root/.openclaw/workspace/skills/lenochka-memory/run_memory.py store --text "..." --importance 0.8 --label "decision"
+python3 /root/.openclaw/workspace/skills/lenochka-memory/run_memory.py recall --query "..." --limit 5
 ```
 
-## Why Separate?
+### lenochka-crm
+```bash
+python3 /root/.openclaw/workspace/skills/lenochka-crm/run_crm.py deal --contact_id 42 --amount 150000 --stage closed_won
+python3 /root/.openclaw/workspace/skills/lenochka-crm/run_crm.py task --contact_id 42 --description "..." --due_date "2026-04-01" --priority normal
+```
 
-Skills are shared. Your setup is yours. Keeping them apart means you can update skills without losing your notes, and share skills without leaking your infrastructure.
+### Прямой SQL
+```bash
+sqlite3 /root/.openclaw/workspace/lenochka-memory/db/lenochka.db "SELECT * FROM v_overdue_tasks"
+```
 
----
+## LLM Config
 
-Add whatever helps you do your job. This is your cheat sheet.
+- Берётся из env: `LEN_LLM_BASE_URL`, `LEN_LLM_API_KEY`, `LEN_LLM_MODEL`
+- Fallback: `LENOCHKA_LLM_*` (обратная совместимость)
+- Модель: `mimo-v2-pro` по умолчанию
+
+## Embeddings
+
+- Основной: sentence-transformers all-MiniLM-L6-v2 (384-dim)
+- Fallback: char 3-gram TF hash (детерминированный через SHA-256)
+- Хранение: sqlite-vec (vec_memories, vec_chaos)

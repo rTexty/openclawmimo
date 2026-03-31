@@ -1,5 +1,17 @@
 # HEARTBEAT.md
 
-# Keep this file empty (or with only comments) to skip heartbeat API calls.
+## Периодические задачи
 
-# Add tasks below when you want the agent to check something periodically.
+При heartbeat-проверке:
+
+1. Проверить pending_notifications в БД (есть ли просроченные?)
+2. Проверить v_overdue_tasks (новые просроченные задачи?)
+3. Проверить v_abandoned_dialogues (брошенные >48ч?)
+4. Если что-то важное — уведомить Камиля
+
+Если ничего нет — HEARTBEAT_OK.
+
+## Примечания
+
+- Не спамить ночью (23:00-08:00 GMT+8) — только критичные алерты
+- Проверять не чаще раза в 30 минут
