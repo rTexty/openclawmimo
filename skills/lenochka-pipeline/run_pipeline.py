@@ -1305,15 +1305,17 @@ def _run_pipeline_inner(
 _THINKING_PATTERNS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"по\s+правилам",
+        # Only match when pipeline-specific terms are present
+        r"по\s+правилам\s+lenochka",
+        r"по\s+правилам\s+(response|pipeline|SKILL)",
         r"pipeline\s+сказал",
-        r"подождите",
-        r"клас{2}ифицировал",
-        r"записал\s+в\s+памят",
-        r"проверил\s+в\s+бд",
+        r"(подождите)\s*.{0,10}(lenochka|pipeline|правилам)",
+        r"клас{2}ифицировал\s+(как|сообщение)",
+        r"записал\s+в\s+(память|базу|CRM)",
+        r"проверил\s+в\s+(бд|базу|CRM)",
         r"по\s+моему\s+анализу",
-        r"решение:\s*я",
-        r"ответ\s+клиенту\s+с",
+        r"решение:\s*я\s+(буду|будем)",
+        r"ответ\s+клиенту\s+(с\s+эскалацией|отправлен)",
         r"lenochka[-_]response",
         r"SKILL\.md",
         r"AGENTS\.md",
