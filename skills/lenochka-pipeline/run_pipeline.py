@@ -384,6 +384,13 @@ def resolve_contact(
     return cid
 
 
+def _normalize_chat_id(chat_id: str) -> str:
+    """Normalize chat_id: убрать префикс 'telegram:' для консистентности с anti-spam state."""
+    if chat_id.startswith("telegram:"):
+        return chat_id.replace("telegram:", "")
+    return chat_id
+
+
 def resolve_chat_thread(
     conn: sqlite3.Connection,
     chat_id: str,
@@ -391,18 +398,19 @@ def resolve_chat_thread(
     chat_type: str,
     title: str | None,
 ) -> int:
+    normalized_id = _normalize_chat_id(chat_id)
     existing = conn.execute(
-        "SELECT id FROM chat_threads WHERE tg_chat_id=?", (chat_id,)
+        "SELECT id FROM chat_threads WHERE tg_chat_id=?", (normalized_id,)
     ).fetchone()
     if existing:
         return existing["id"]
     conn.execute(
         "INSERT INTO chat_threads (tg_chat_id, contact_id, type, title) VALUES (?, ?, ?, ?)",
-        (chat_id, contact_id, chat_type, title),
+        (normalized_id, contact_id, chat_type, title),
     )
     conn.commit()
     tid: int = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    log(f"resolve_thread: created chat_thread_id={tid} chat_id={chat_id}")
+    log(f"resolve_thread: created chat_thread_id={tid} chat_id={normalized_id}")
     return tid
 
 
@@ -632,13 +640,14 @@ def _with_state_lock(fn):
 @_with_state_lock
 def can_respond(chat_id: str) -> bool:
     """True = anti-spam разрешает ответ."""
+    normalized_id = _normalize_chat_id(chat_id)
     state = _load_state()
-    chat_state = state.get(chat_id, {})
+    chat_state = state.get(normalized_id, {})
     now_ts = now_utc().timestamp()
 
     cooldown_until = chat_state.get("cooldown_until", 0)
     if now_ts < cooldown_until:
-        log(f"antispam: cooldown for {chat_id} until {cooldown_until:.0f}")
+        log(f"antispam: cooldown for {normalized_id} until {cooldown_until:.0f}")
         return False
 
     last_response = chat_state.get("last_response", 0)
@@ -654,8 +663,9 @@ def can_respond(chat_id: str) -> bool:
 @_with_state_lock
 def record_response(chat_id: str) -> None:
     """Обновить счётчик после отправленного ответа."""
+    normalized_id = _normalize_chat_id(chat_id)
     state = _load_state()
-    chat_state = state.get(chat_id, {})
+    chat_state = state.get(normalized_id, {})
     now_ts = now_utc().timestamp()
 
     last_response = chat_state.get("last_response", 0)
@@ -672,9 +682,9 @@ def record_response(chat_id: str) -> None:
     if consecutive >= MAX_CONSECUTIVE_RESPONSES:
         chat_state["cooldown_until"] = now_ts + COOLDOWN_S
         chat_state["consecutive"] = 0
-        log(f"antispam: cooldown {COOLDOWN_S}s triggered for {chat_id}")
+        log(f"antispam: cooldown {COOLDOWN_S}s triggered for {normalized_id}")
 
-    state[chat_id] = chat_state
+    state[normalized_id] = chat_state
     _save_state_atomic(state)
 
 
