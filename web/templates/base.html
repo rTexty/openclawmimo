@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Lenochka Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="layout">
+        <nav class="sidebar">
+            <h2>🔧 Lenochka</h2>
+            <ul>
+                <li><a href="/" class="{% if request.path == '/' %}active{% endif %}">Dashboard</a></li>
+                <li><a href="/crm" class="{% if request.path == '/crm' %}active{% endif %}">CRM</a></li>
+                <li><a href="/messages" class="{% if request.path == '/messages' %}active{% endif %}">Messages</a></li>
+                <li><a href="/memories" class="{% if request.path == '/memories' %}active{% endif %}">Memories</a></li>
+                <li><a href="/notifications" class="{% if request.path == '/notifications' %}active{% endif %}">Notifications</a></li>
+                <li><a href="/views" class="{% if request.path == '/views' %}active{% endif %}">Views</a></li>
+            </ul>
+        </nav>
+        <main class="content">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+    <script>
+        setInterval(() => location.reload(), 5000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; }
+.layout { display: flex; min-height: 100vh; }
+.sidebar { width: 200px; background: #16213e; padding: 20px; position: fixed; height: 100vh; overflow-y: auto; }
+.sidebar h2 { color: #00d4ff; margin-bottom: 20px; font-size: 1.2rem; }
+.sidebar ul { list-style: none; }
+.sidebar li { margin: 8px 0; }
+.sidebar a { color: #a0a0a0; text-decoration: none; display: block; padding: 8px 12px; border-radius: 4px; }
+.sidebar a:hover, .sidebar a.active { background: #0f3460; color: #00d4ff; }
+.content { margin-left: 200px; padding: 30px; flex: 1; }
+h1 { color: #00d4ff; margin-bottom: 20px; }
+h2 { color: #e94560; margin: 20px 0 10px; }
+table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 0.85rem; }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #2a2a4a; }
+th { background: #16213e; color: #00d4ff; position: sticky; top: 0; }
+tr:hover { background: #1a1a3e; }
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 15px; margin: 20px 0; }
+.stat-card { background: #16213e; padding: 20px; border-radius: 8px; text-align: center; }
+.stat-card .number { font-size: 2rem; color: #00d4ff; }
+.stat-card .label { color: #a0a0a0; font-size: 0.8rem; margin-top: 5px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+.badge-open { background: #0f3460; color: #00d4ff; }
+.badge-done { background: #1a3a1a; color: #4caf50; }
+.badge-pending { background: #3a2a0a; color: #ff9800; }
+.badge-urgent { background: #3a0a0a; color: #e94560; }
+.badge-chit-chat { background: #1a1a3e; color: #a0a0a0; }
+.badge-task { background: #0f3460; color: #00d4ff; }
+.badge-decision { background: #1a3a1a; color: #4caf50; }
+.badge-lead-signal { background: #3a2a0a; color: #ff9800; }
+.badge-risk { background: #3a0a0a; color: #e94560; }
+.badge-business-small { background: #2a1a2a; color: #c084fc; }
+.badge-noise { background: #1a1a1a; color: #666; }
+.badge-other { background: #2a2a2a; color: #888; }
+.filter-bar { display: flex; gap: 10px; margin: 15px 0; flex-wrap: wrap; }
+.filter-bar select, .filter-bar input { background: #16213e; color: #e0e0e0; border: 1px solid #2a2a4a; padding: 6px 12px; border-radius: 4px; }
+.text-truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.text-small { font-size: 0.8rem; color: #888; }
