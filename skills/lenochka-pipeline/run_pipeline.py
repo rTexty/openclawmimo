@@ -970,8 +970,11 @@ def decide_response(
 
     # ── ESCALATION (анти-spam НЕ блокирует!) ──
     # "other" = LLM не смог → эскалировать (безопаснее молчать)
-    should_escalate = label in ("lead-signal", "risk", "other") or (
-        label == "task" and confidence < 0.85
+    # "decision" + low confidence = deal-confirm safety net → эскалировать
+    should_escalate = (
+        label in ("lead-signal", "risk", "other")
+        or (label == "task" and confidence < 0.85)
+        or (label == "decision" and confidence < 0.5)
     )
     if should_escalate:
         # Проверить повторные вопросы → повышенная срочность
@@ -1243,6 +1246,16 @@ def _run_pipeline_inner(
     # Валидация confidence
     if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 1):
         confidence = 0.5
+
+    # Safety net: DEAL_CONFIRM_PHRASES, если LLM ошибочно классифицировал как silent,
+    # всё равно эскалировать — это может быть подтверждение сделки
+    normalized_text = re.sub(r"[\s.,!?;:]+$", "", text.lower().strip())
+    if normalized_text in DEAL_CONFIRM_PHRASES and label in SILENT_LABELS:
+        log(
+            f"deal-confirm safety: '{normalized_text}' classified as {label!r} → override to decision"
+        )
+        label = "decision"
+        confidence = 0.4  # force escalation path
 
     log(f"ingest: label={label} conf={confidence:.2f}")
 
