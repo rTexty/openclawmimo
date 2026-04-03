@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS leads (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX IF NOT EXISTS idx_leads_contact_status ON leads(contact_id, status);
+
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lead_id INTEGER REFERENCES leads(id),
@@ -84,6 +86,8 @@ CREATE TABLE IF NOT EXISTS deals (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_deals_contact_stage ON deals(contact_id, stage);
 
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +106,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_related ON tasks(related_type, related_id);
 
 CREATE TABLE IF NOT EXISTS agreements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,8 +168,10 @@ CREATE TABLE IF NOT EXISTS memories (
     content TEXT NOT NULL,
     content_hash TEXT,
     type TEXT NOT NULL CHECK(type IN ('episodic', 'semantic', 'procedural')),
+    category TEXT DEFAULT 'other' CHECK(category IN ('decision', 'risk', 'policy', 'fact', 'event', 'task', 'lead-signal', 'other')),
     importance REAL DEFAULT 0.5 CHECK(importance >= 0 AND importance <= 1),
     strength REAL DEFAULT 1.0,
+    access_count INTEGER DEFAULT 0,
     tenant_id TEXT,
     contact_id INTEGER REFERENCES contacts(id),
     chat_thread_id INTEGER REFERENCES chat_threads(id),
@@ -181,6 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_contact ON memories(contact_id);
 CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+CREATE INDEX IF NOT EXISTS idx_memories_source_msg ON memories(source_message_id);
 
 CREATE TABLE IF NOT EXISTS associations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,76 +222,30 @@ CREATE INDEX IF NOT EXISTS idx_raptor_parent ON raptor_nodes(parent_id);
 -- Векторная таблица для семантического поиска memories
 -- Создаётся программно через sqlite-vec при init:
 -- CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[384])
---
--- Векторная таблица для CHAOS entries:
--- CREATE VIRTUAL TABLE vec_chaos USING vec0(embedding float[384])
 
 -- ============================================
--- СЛОЙ 3: CHAOS MEMORY (Гибридный поиск)
+-- FTS для memories (быстрый поиск по контенту + category)
 -- ============================================
 
-CREATE TABLE IF NOT EXISTS chaos_entries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content TEXT NOT NULL,
-    category TEXT CHECK(category IN ('decision', 'risk', 'policy', 'fact', 'event', 'task', 'lead-signal', 'other')),
-    priority REAL DEFAULT 0.5,
-    memory_id INTEGER REFERENCES memories(id),
-    contact_id INTEGER REFERENCES contacts(id),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    access_count INTEGER DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_chaos_category ON chaos_entries(category);
-CREATE INDEX IF NOT EXISTS idx_chaos_priority ON chaos_entries(priority);
-CREATE INDEX IF NOT EXISTS idx_chaos_heat ON chaos_entries(last_accessed_at, access_count);
-
--- BM25 через FTS5 с trigram-токенизатором (лучше для кириллицы)
-CREATE VIRTUAL TABLE IF NOT EXISTS chaos_fts USING fts5(
-    content,
-    category,
-    content=chaos_entries,
-    content_rowid=id,
-    tokenize='trigram'
-);
-
--- Триггеры для FTS синхронизации
-CREATE TRIGGER IF NOT EXISTS chaos_ai AFTER INSERT ON chaos_entries BEGIN
-    INSERT INTO chaos_fts(rowid, content, category)
-    VALUES (new.id, new.content, new.category);
-END;
-
-CREATE TRIGGER IF NOT EXISTS chaos_ad AFTER DELETE ON chaos_entries BEGIN
-    INSERT INTO chaos_fts(chaos_fts, rowid, content, category)
-    VALUES ('delete', old.id, old.content, old.category);
-END;
-
-CREATE TRIGGER IF NOT EXISTS chaos_au AFTER UPDATE ON chaos_entries BEGIN
-    INSERT INTO chaos_fts(chaos_fts, rowid, content, category)
-    VALUES ('delete', old.id, old.content, old.category);
-    INSERT INTO chaos_fts(rowid, content, category)
-    VALUES (new.id, new.content, new.category);
-END;
-
--- Также FTS для memories (быстрый поиск по контенту)
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
+    category,
     content=memories,
     content_rowid=id,
     tokenize='trigram'
 );
 
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO memories_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    INSERT INTO memories_fts(memories_fts, rowid, content, category) VALUES ('delete', old.id, old.content, old.category);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
-    INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO memories_fts(memories_fts, rowid, content, category) VALUES ('delete', old.id, old.content, old.category);
+    INSERT INTO memories_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
 END;
 
 -- ============================================
@@ -346,3 +308,22 @@ CREATE INDEX IF NOT EXISTS idx_pending_notify_entity ON pending_notifications(en
 -- Добавляем в tasks: когда последний раз проверяли прогресс
 -- (через ALTER при миграции, здесь для новых БД)
 -- last_progress_check уже есть в schema v2 через миграцию
+
+-- ============================================
+-- LOAD SESSIONS: импорт истории чатов
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS load_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting_files',
+    files_path TEXT,
+    messages_count INTEGER DEFAULT 0,
+    contact_id INTEGER REFERENCES contacts(id),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_load_sessions_status ON load_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_load_sessions_chat ON load_sessions(chat_id, owner_id);

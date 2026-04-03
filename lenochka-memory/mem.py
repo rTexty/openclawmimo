@@ -8,9 +8,6 @@ Lenochka Memory CLI v2 — Единый инструмент памяти
     python3 mem.py store "текст" [--type ...]    — записать memory
     python3 mem.py recall "запрос" [--strategy]  — поиск по памяти
     python3 mem.py recall-assoc --from-id N      — связанные memories
-    python3 mem.py chaos-store "текст"           — запись в CHAOS
-    python3 mem.py chaos-search "запрос"         — поиск в CHAOS
-    python3 mem.py chaos-reindex                 — пересобрать FTS
     python3 mem.py crm <subcommand>              — CRM-запросы
     python3 mem.py ingest "текст" [--contact-id] — полный пайплайн
     python3 mem.py context "запрос"              — контекст-пакет для LLM
@@ -51,6 +48,7 @@ def _load_vec(conn):
     try:
         conn.enable_load_extension(True)
         import sqlite_vec
+
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
         return True
@@ -59,7 +57,7 @@ def _load_vec(conn):
 
 
 # Current schema version — increment on every schema change
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def init():
@@ -73,8 +71,9 @@ def init():
 
         # Создать векторные таблицы через sqlite-vec
         if _load_vec(conn):
-            conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{EMBEDDING_DIM}])")
-            conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chaos USING vec0(embedding float[{EMBEDDING_DIM}])")
+            conn.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{EMBEDDING_DIM}])"
+            )
             print("✅ Векторные таблицы (sqlite-vec) созданы")
         else:
             print("⚠️ sqlite-vec недоступен — векторный поиск отключён")
@@ -118,7 +117,9 @@ def _migrate_v2(conn):
     cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
     if "content_hash" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash)"
+        )
         print("   + messages.content_hash")
 
     # contacts.tg_user_id
@@ -139,32 +140,57 @@ def _migrate_v4(conn):
 
 # === STORE (Capture) ===
 
-def store(content, mem_type="episodic", importance=0.5, contact_id=None,
-          chat_thread_id=None, deal_id=None, source_message_id=None, tags=None,
-          content_hash=None, auto_associate=True):
+
+def store(
+    content,
+    mem_type="episodic",
+    importance=0.5,
+    category="other",
+    contact_id=None,
+    chat_thread_id=None,
+    deal_id=None,
+    source_message_id=None,
+    tags=None,
+    content_hash=None,
+    auto_associate=True,
+):
     """Записать memory в Agent Memory + векторный эмбеддинг (одна транзакция)."""
     conn = get_db()
     tags_json = json.dumps(tags) if tags else None
     chash = content_hash or _content_hash(content)
     mid = None
     try:
-        conn.execute("""
-            INSERT INTO memories (content, content_hash, type, importance, strength, contact_id,
+        conn.execute(
+            """
+            INSERT INTO memories (content, content_hash, type, category, importance, strength, contact_id,
                                  chat_thread_id, deal_id, source_message_id, tags)
-            VALUES (?, ?, ?, ?, 1.0, ?, ?, ?, ?, ?)
-        """, (content, chash, mem_type, importance, contact_id, chat_thread_id,
-              deal_id, source_message_id, tags_json))
+            VALUES (?, ?, ?, ?, ?, 1.0, ?, ?, ?, ?, ?)
+        """,
+            (
+                content,
+                chash,
+                mem_type,
+                category,
+                importance,
+                contact_id,
+                chat_thread_id,
+                deal_id,
+                source_message_id,
+                tags_json,
+            ),
+        )
         mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         # Векторный эмбеддинг → vec_memories (в той же транзакции)
         try:
             from brain import embed_text, vec_to_blob
+
             vec = embed_text(content)
             vec_blob = vec_to_blob(vec)
             if _load_vec(conn):
                 conn.execute(
                     "INSERT INTO vec_memories(rowid, embedding) VALUES (?, ?)",
-                    (mid, vec_blob)
+                    (mid, vec_blob),
                 )
         except Exception as e:
             print(f"⚠️ Не удалось записать вектор: {e}", file=sys.stderr)
@@ -178,12 +204,13 @@ def store(content, mem_type="episodic", importance=0.5, contact_id=None,
         conn.close()
         raise
     conn.close()
-    print(f"✅ Memory #{mid} записан [{mem_type}] importance={importance}")
+    print(f"✅ Memory #{mid} записан [{mem_type}/{category}] importance={importance}")
 
     # Автосвязывание (вне транзакции — не критично)
     if auto_associate:
         try:
             from brain import auto_associate as _auto_assoc
+
             assocs = _auto_assoc(mid, content)
             if assocs:
                 print(f"   🔗 Создано {len(assocs)} ассоциаций")
@@ -195,13 +222,14 @@ def store(content, mem_type="episodic", importance=0.5, contact_id=None,
 
 # === RECALL (Search) ===
 
+
 def _rrf_rank(results: list[dict], limit: int, k: int = 60) -> list[dict]:
     """
     Reciprocal Rank Fusion — нормализует скоры из разных источников.
-    
+
     Проблема: vector scores 0-1, BM25 ranks -10..0, keyword scores arbitrary.
     RRF решает: ранжирует по позиции в каждом списке, не по абсолютному скору.
-    
+
     Formula: RRF_score(item) = sum(1 / (k + rank_in_source + 1))
     k=60 — стандартная константа (устойчива к выбросам).
     """
@@ -232,7 +260,9 @@ def _rrf_rank(results: list[dict], limit: int, k: int = 60) -> list[dict]:
                         # Same item in different source — combine ranks
                         key = _item_key(item)
                         rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (k + rank + 1)
-                        rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (k + other_rank + 1)
+                        rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (
+                            k + other_rank + 1
+                        )
                         item_map[key] = item
                         break
                 else:
@@ -280,8 +310,10 @@ def _item_key(item: dict) -> tuple:
         return ("memory", item["id"])
     return (src, item["id"])
 
-def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
-           mem_type=None, limit=20):
+
+def recall(
+    query, strategy="hybrid", contact_id=None, deal_id=None, mem_type=None, limit=20
+):
     """
     Поиск по памяти.
     strategy: hybrid | vector | bm25 | keyword
@@ -293,72 +325,69 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
     if strategy in ("hybrid", "vector"):
         try:
             from brain import embed_text, vec_to_blob
+
             vec = embed_text(query)
             vec_blob = vec_to_blob(vec)
             if _load_vec(conn):
-                rows = conn.execute("""
+                rows = conn.execute(
+                    """
                     SELECT vm.rowid as id, m.content, m.type, m.importance,
                            m.strength, m.contact_id, m.created_at, distance
                     FROM vec_memories vm
                     JOIN memories m ON vm.rowid = m.id
                     WHERE vm.embedding MATCH ? AND k = ?
                     ORDER BY distance
-                """, (vec_blob, limit)).fetchall()
+                """,
+                    (vec_blob, limit),
+                ).fetchall()
                 for r in rows:
                     score = 1.0 - r["distance"] if r["distance"] is not None else 0
-                    results.append({
-                        "id": r["id"], "content": r["content"], "type": r["type"],
-                        "importance": r["importance"], "strength": r["strength"],
-                        "contact_id": r["contact_id"], "created_at": r["created_at"],
-                        "score": round(score, 4), "source": "vector",
-                    })
+                    results.append(
+                        {
+                            "id": r["id"],
+                            "content": r["content"],
+                            "type": r["type"],
+                            "importance": r["importance"],
+                            "strength": r["strength"],
+                            "contact_id": r["contact_id"],
+                            "created_at": r["created_at"],
+                            "score": round(score, 4),
+                            "source": "vector",
+                        }
+                    )
         except Exception as e:
             pass
 
-    # 2. BM25 по CHAOS FTS (trigram)
-    if strategy in ("hybrid", "bm25"):
-        try:
-            rows = conn.execute("""
-                SELECT ce.id, ce.content, ce.category, ce.priority, ce.contact_id,
-                       rank, 'chaos' as source
-                FROM chaos_fts
-                JOIN chaos_entries ce ON chaos_fts.rowid = ce.id
-                WHERE chaos_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-            """, (query, limit)).fetchall()
-            for r in rows:
-                results.append({
-                    "id": r["id"], "content": r["content"],
-                    "category": r["category"], "priority": r["priority"],
-                    "contact_id": r["contact_id"],
-                    "score": abs(r["rank"]) if r["rank"] else 0,
-                    "source": "chaos",
-                })
-        except Exception as e:
-            print(f"⚠️ FTS chaos search error: {e}", file=sys.stderr)
-
-    # 3. BM25 по memories FTS (trigram — лучше для кириллицы чем LIKE)
+    # 2. BM25 по memories FTS (trigram — лучше для кириллицы чем LIKE)
     if strategy in ("hybrid", "bm25"):
         try:
             fts_query = f'"{query}"' if " " in query else query
-            rows = conn.execute("""
-                SELECT m.id, m.content, m.type, m.importance, m.strength,
+            rows = conn.execute(
+                """
+                SELECT m.id, m.content, m.type, m.category, m.importance, m.strength,
                        m.contact_id, m.created_at, rank, 'agent_memory_fts' as source
                 FROM memories_fts
                 JOIN memories m ON memories_fts.rowid = m.id
                 WHERE memories_fts MATCH ?
                 ORDER BY rank
                 LIMIT ?
-            """, (fts_query, limit)).fetchall()
+            """,
+                (fts_query, limit),
+            ).fetchall()
             for r in rows:
-                results.append({
-                    "id": r["id"], "content": r["content"], "type": r["type"],
-                    "importance": r["importance"], "strength": r["strength"],
-                    "contact_id": r["contact_id"], "created_at": r["created_at"],
-                    "score": abs(r["rank"]) if r["rank"] else 0,
-                    "source": "agent_memory_fts",
-                })
+                results.append(
+                    {
+                        "id": r["id"],
+                        "content": r["content"],
+                        "type": r["type"],
+                        "importance": r["importance"],
+                        "strength": r["strength"],
+                        "contact_id": r["contact_id"],
+                        "created_at": r["created_at"],
+                        "score": abs(r["rank"]) if r["rank"] else 0,
+                        "source": "agent_memory_fts",
+                    }
+                )
         except Exception as e:
             print(f"⚠️ FTS memories search error: {e}", file=sys.stderr)
 
@@ -389,12 +418,19 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
         for r in rows:
             kw_count = r["content"].lower().count(query.lower())
             score = r["importance"] * r["strength"] + kw_count * 0.3
-            results.append({
-                "id": r["id"], "content": r["content"], "type": r["type"],
-                "importance": r["importance"], "strength": r["strength"],
-                "contact_id": r["contact_id"], "created_at": r["created_at"],
-                "score": score, "source": "agent_memory",
-            })
+            results.append(
+                {
+                    "id": r["id"],
+                    "content": r["content"],
+                    "type": r["type"],
+                    "importance": r["importance"],
+                    "strength": r["strength"],
+                    "contact_id": r["contact_id"],
+                    "created_at": r["created_at"],
+                    "score": score,
+                    "source": "agent_memory",
+                }
+            )
 
     # Dedup + sort
     seen = set()
@@ -417,15 +453,17 @@ def recall(query, strategy="hybrid", contact_id=None, deal_id=None,
         expansion = _expand_entity_context(unique[:5], conn=conn)
         # Добавляем расширенный контекст как отдельную секцию
         if expansion:
-            unique.append({
-                "id": 0,
-                "content": _format_entity_context(expansion),
-                "type": "entity_context",
-                "importance": 0.0,
-                "score": -1,  # всегда в конце
-                "source": "entity_expansion",
-                "_expansion": expansion,
-            })
+            unique.append(
+                {
+                    "id": 0,
+                    "content": _format_entity_context(expansion),
+                    "type": "entity_context",
+                    "importance": 0.0,
+                    "score": -1,  # всегда в конце
+                    "source": "entity_expansion",
+                    "_expansion": expansion,
+                }
+            )
 
     conn.close()
     return unique[:limit]
@@ -450,11 +488,11 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
         conn = get_db()
 
     expansion = {
-        "contacts": {},    # contact_id → {name, tg_username, company, ...}
-        "deals": {},       # deal_id → {amount, stage, contact_name, ...}
-        "tasks": [],       # [{description, due_at, priority, related_deal}]
-        "memories": [],    # другие memories о тех же contacts/deals
-        "messages": [],    # последние сообщения из чатов
+        "contacts": {},  # contact_id → {name, tg_username, company, ...}
+        "deals": {},  # deal_id → {amount, stage, contact_name, ...}
+        "tasks": [],  # [{description, due_at, priority, related_deal}]
+        "memories": [],  # другие memories о тех же contacts/deals
+        "messages": [],  # последние сообщения из чатов
     }
 
     try:
@@ -471,11 +509,15 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
 
             # Ищем memory в БД для получения FK
             try:
-                mrow = conn.execute(
-                    """SELECT contact_id, deal_id, chat_thread_id, source_message_id
+                mrow = (
+                    conn.execute(
+                        """SELECT contact_id, deal_id, chat_thread_id, source_message_id
                        FROM memories WHERE id = ?""",
-                    (rid,),
-                ).fetchone() if rid else None
+                        (rid,),
+                    ).fetchone()
+                    if rid
+                    else None
+                )
             except Exception:
                 mrow = None
 
@@ -487,36 +529,19 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
                 if mrow["chat_thread_id"]:
                     chat_thread_ids.add(mrow["chat_thread_id"])
 
-            # Также проверяем chaos_entries → memory_id → FK
-            try:
-                crow = conn.execute(
-                    """SELECT m.contact_id, m.deal_id, m.chat_thread_id
-                       FROM chaos_entries ce
-                       LEFT JOIN memories m ON ce.memory_id = m.id
-                       WHERE ce.id = ?""",
-                    (rid,),
-                ).fetchone() if r.get("source") == "chaos" else None
-            except Exception:
-                crow = None
-
-            if crow:
-                if crow["contact_id"]:
-                    contact_ids.add(crow["contact_id"])
-                if crow["deal_id"]:
-                    deal_ids.add(crow["deal_id"])
-                if crow["chat_thread_id"]:
-                    chat_thread_ids.add(crow["chat_thread_id"])
-
         # 2. CONTACTS — кто клиенты
         if contact_ids:
             placeholders = ",".join("?" * len(contact_ids))
-            rows = conn.execute(f"""
+            rows = conn.execute(
+                f"""
                 SELECT c.id, c.name, c.tg_username, c.phones, c.company_id,
                        comp.name as company_name, c.notes
                 FROM contacts c
                 LEFT JOIN companies comp ON c.company_id = comp.id
                 WHERE c.id IN ({placeholders})
-            """, list(contact_ids)).fetchall()
+            """,
+                list(contact_ids),
+            ).fetchall()
             for r in rows:
                 expansion["contacts"][r["id"]] = {
                     "name": r["name"],
@@ -529,14 +554,17 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
         # 3. DEALS — активные сделки с деталями
         if deal_ids:
             placeholders = ",".join("?" * len(deal_ids))
-            rows = conn.execute(f"""
+            rows = conn.execute(
+                f"""
                 SELECT d.id, d.amount, d.stage, d.expected_close_at, d.notes,
                        c.name as contact_name, l.source as lead_source
                 FROM deals d
                 JOIN contacts c ON d.contact_id = c.id
                 LEFT JOIN leads l ON d.lead_id = l.id
                 WHERE d.id IN ({placeholders})
-            """, list(deal_ids)).fetchall()
+            """,
+                list(deal_ids),
+            ).fetchall()
             for r in rows:
                 expansion["deals"][r["id"]] = {
                     "amount": r["amount"],
@@ -552,16 +580,21 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
         task_params = []
         if deal_ids:
             placeholders = ",".join("?" * len(deal_ids))
-            task_conditions.append(f"(related_type = 'deal' AND related_id IN ({placeholders}))")
+            task_conditions.append(
+                f"(related_type = 'deal' AND related_id IN ({placeholders}))"
+            )
             task_params.extend(list(deal_ids))
         if contact_ids:
             placeholders = ",".join("?" * len(contact_ids))
-            task_conditions.append(f"(related_type = 'contact' AND related_id IN ({placeholders}))")
+            task_conditions.append(
+                f"(related_type = 'contact' AND related_id IN ({placeholders}))"
+            )
             task_params.extend(list(contact_ids))
 
         if task_conditions:
             where = " OR ".join(task_conditions)
-            rows = conn.execute(f"""
+            rows = conn.execute(
+                f"""
                 SELECT description, due_at, priority, status, related_type, related_id
                 FROM tasks
                 WHERE ({where}) AND status NOT IN ('done', 'cancelled')
@@ -569,14 +602,18 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
                     CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
                     due_at ASC
                 LIMIT 10
-            """, task_params).fetchall()
+            """,
+                task_params,
+            ).fetchall()
             for r in rows:
-                expansion["tasks"].append({
-                    "description": r["description"],
-                    "due_at": r["due_at"],
-                    "priority": r["priority"],
-                    "status": r["status"],
-                })
+                expansion["tasks"].append(
+                    {
+                        "description": r["description"],
+                        "due_at": r["due_at"],
+                        "priority": r["priority"],
+                        "status": r["status"],
+                    }
+                )
 
         # 5. MEMORIES — другие memories о тех же контактах/сделках
         mem_conditions = []
@@ -593,25 +630,31 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
         if mem_conditions and source_memory_ids:
             where = " OR ".join(mem_conditions)
             src_placeholders = ",".join("?" * len(source_memory_ids))
-            rows = conn.execute(f"""
+            rows = conn.execute(
+                f"""
                 SELECT id, content, type, importance, created_at
                 FROM memories
                 WHERE ({where}) AND id NOT IN ({src_placeholders})
                 ORDER BY importance DESC, created_at DESC
                 LIMIT ?
-            """, mem_params + list(source_memory_ids) + [max_memories]).fetchall()
+            """,
+                mem_params + list(source_memory_ids) + [max_memories],
+            ).fetchall()
             for r in rows:
-                expansion["memories"].append({
-                    "content": r["content"],
-                    "type": r["type"],
-                    "importance": r["importance"],
-                    "created_at": r["created_at"],
-                })
+                expansion["memories"].append(
+                    {
+                        "content": r["content"],
+                        "type": r["type"],
+                        "importance": r["importance"],
+                        "created_at": r["created_at"],
+                    }
+                )
 
         # 6. MESSAGES — последние сообщения из связанных чатов
         if chat_thread_ids:
             placeholders = ",".join("?" * len(chat_thread_ids))
-            rows = conn.execute(f"""
+            rows = conn.execute(
+                f"""
                 SELECT m.text, m.from_user_id, m.sent_at, ct.title as chat_title
                 FROM messages m
                 JOIN chat_threads ct ON m.chat_thread_id = ct.id
@@ -619,14 +662,22 @@ def _expand_entity_context(top_results, conn=None, max_memories=8, max_messages=
                   AND (m.meta_json IS NULL OR json_extract(m.meta_json, '$.deleted') IS NULL)
                 ORDER BY m.sent_at DESC
                 LIMIT ?
-            """, list(chat_thread_ids) + [max_messages]).fetchall()
+            """,
+                list(chat_thread_ids) + [max_messages],
+            ).fetchall()
             for r in rows:
-                author = "Я" if r["from_user_id"] == "self" else (r["chat_title"] or "Клиент")
-                expansion["messages"].append({
-                    "author": author,
-                    "text": r["text"][:150] if r["text"] else "",
-                    "sent_at": r["sent_at"],
-                })
+                author = (
+                    "Я"
+                    if r["from_user_id"] == "self"
+                    else (r["chat_title"] or "Клиент")
+                )
+                expansion["messages"].append(
+                    {
+                        "author": author,
+                        "text": r["text"][:150] if r["text"] else "",
+                        "sent_at": r["sent_at"],
+                    }
+                )
 
     except Exception as e:
         print(f"⚠️ Entity expansion error: {e}", file=sys.stderr)
@@ -663,7 +714,13 @@ def _format_entity_context(expansion):
     if expansion["tasks"]:
         task_lines = []
         for t in expansion["tasks"][:5]:
-            icon = "🔴" if t["priority"] == "urgent" else "🟡" if t["priority"] == "high" else "⚪"
+            icon = (
+                "🔴"
+                if t["priority"] == "urgent"
+                else "🟡"
+                if t["priority"] == "high"
+                else "⚪"
+            )
             due = f" (до {t['due_at'][:10]})" if t.get("due_at") else ""
             task_lines.append(f"  {icon} {t['description'][:60]}{due}")
         if task_lines:
@@ -696,7 +753,8 @@ def recall_assoc(memory_id, hops=1, limit=10):
     for _ in range(hops):
         next_level = []
         for mid in current:
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT m.*, a.relation_type, a.weight
                 FROM associations a
                 JOIN memories m ON (
@@ -706,139 +764,43 @@ def recall_assoc(memory_id, hops=1, limit=10):
                 WHERE (a.memory_id_from = ? OR a.memory_id_to = ?)
                   AND m.id NOT IN ({})
             """.format(",".join("?" * len(visited))),
-                [mid, mid, mid] + list(visited)
+                [mid, mid, mid] + list(visited),
             ).fetchall()
 
             for r in rows:
                 visited.add(r["id"])
                 next_level.append(r["id"])
-                results.append({
-                    "id": r["id"], "content": r["content"], "type": r["type"],
-                    "relation": r["relation_type"], "weight": r["weight"],
-                    "strength": r["strength"],
-                })
+                results.append(
+                    {
+                        "id": r["id"],
+                        "content": r["content"],
+                        "type": r["type"],
+                        "relation": r["relation_type"],
+                        "weight": r["weight"],
+                        "strength": r["strength"],
+                    }
+                )
         current = next_level
 
     conn.close()
     return results[:limit]
 
 
-# === CHAOS ===
-
-def chaos_store(content, category="other", priority=0.5,
-                memory_id=None, contact_id=None):
-    """Записать entry в CHAOS + векторный эмбеддинг (одна транзакция)."""
-    conn = get_db()
-    eid = None
-    try:
-        conn.execute("""
-            INSERT INTO chaos_entries (content, category, priority, memory_id, contact_id)
-            VALUES (?, ?, ?, ?, ?)
-        """, (content, category, priority, memory_id, contact_id))
-        eid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-        # Векторный эмбеддинг → vec_chaos (в той же транзакции)
-        try:
-            from brain import embed_text, vec_to_blob
-            vec = embed_text(content)
-            vec_blob = vec_to_blob(vec)
-            if _load_vec(conn):
-                conn.execute(
-                    "INSERT INTO vec_chaos(rowid, embedding) VALUES (?, ?)",
-                    (eid, vec_blob)
-                )
-        except Exception as e:
-            print(f"⚠️ Не удалось записать вектор chaos: {e}", file=sys.stderr)
-
-        # Один COMMIT на обе операции
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ chaos_store() failed: {e}", file=sys.stderr)
-        conn.close()
-        raise
-
-    conn.close()
-    print(f"✅ CHAOS #{eid} записан [{category}] priority={priority}")
-    return eid
-
-
-def chaos_search(query, mode="index", limit=10):
-    """Поиск в CHAOS (read-only — НЕ обновляет heat/access_count)."""
-    conn = get_db()
-    results = []
-
-    if mode == "index":
-        # BM25 via FTS (trigram tokenizer)
-        try:
-            rows = conn.execute("""
-                SELECT ce.*, rank
-                FROM chaos_fts
-                JOIN chaos_entries ce ON chaos_fts.rowid = ce.id
-                WHERE chaos_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-            """, (query, limit)).fetchall()
-            results = [dict(r) for r in rows]
-        except Exception as e:
-            print(f"FTS error: {e}", file=sys.stderr)
-
-        # Fallback LIKE (Cyrillic workaround)
-        if not results:
-            rows = conn.execute("""
-                SELECT *, (priority + 0.1 * access_count) as heat_score
-                FROM chaos_entries
-                WHERE content LIKE ? OR category LIKE ?
-                ORDER BY heat_score DESC
-                LIMIT ?
-            """, (f"%{query}%", f"%{query}%", limit)).fetchall()
-            results = [dict(r) for r in rows]
-
-    elif mode == "full":
-        rows = conn.execute("""
-            SELECT *, (priority + 0.1 * access_count) as heat_score
-            FROM chaos_entries
-            WHERE content LIKE ?
-            ORDER BY heat_score DESC
-            LIMIT ?
-        """, (f"%{query}%", limit)).fetchall()
-        results = [dict(r) for r in rows]
-
-    conn.close()
-    return results
-
-
-def chaos_touch(chaos_id: int):
-    """Обновить heat при явном доступе к CHAOS entry (не поиск, а использование)."""
-    conn = get_db()
-    conn.execute("""
-        UPDATE chaos_entries
-        SET access_count = access_count + 1, last_accessed_at = datetime('now')
-        WHERE id = ?
-    """, (chaos_id,))
-    conn.commit()
-    conn.close()
-
-
-def chaos_reindex():
-    """Пересобрать FTS-индекс CHAOS."""
-    conn = get_db()
-    conn.execute("INSERT INTO chaos_fts(chaos_fts) VALUES('rebuild')")
-    conn.commit()
-    conn.close()
-    print("✅ CHAOS FTS-индекс пересобран")
-
-
 # === CRM ===
+
 
 def crm_contact(tg=None, contact_id=None):
     """Получить контакт."""
     conn = get_db()
     if contact_id:
-        row = conn.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (contact_id,)
+        ).fetchone()
     elif tg:
         tg_clean = tg.lstrip("@")
-        row = conn.execute("SELECT * FROM contacts WHERE tg_username = ?", (tg_clean,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM contacts WHERE tg_username = ?", (tg_clean,)
+        ).fetchone()
     else:
         print("Укажите --tg или --contact-id")
         return None
@@ -850,12 +812,15 @@ def crm_deals(contact_id=None):
     """Сделки контакта."""
     conn = get_db()
     if contact_id:
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT d.*, c.name as contact_name FROM deals d
             JOIN contacts c ON d.contact_id = c.id
             WHERE d.contact_id = ?
             ORDER BY d.created_at DESC
-        """, (contact_id,)).fetchall()
+        """,
+            (contact_id,),
+        ).fetchall()
     else:
         rows = conn.execute("""
             SELECT d.*, c.name as contact_name FROM deals d
@@ -878,7 +843,8 @@ def crm_overdue_tasks():
 def crm_abandoned(hours=24):
     """Брошенные диалоги."""
     conn = get_db()
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT ct.id, ct.title, ct.tg_chat_id,
                c.name as contact_name, c.tg_username,
                MAX(m.sent_at) as last_message_at,
@@ -890,7 +856,9 @@ def crm_abandoned(hours=24):
         GROUP BY ct.id
         HAVING hours_since > ?
         ORDER BY hours_since DESC
-    """, (hours,)).fetchall()
+    """,
+        (hours,),
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -899,12 +867,15 @@ def crm_leads(since=None):
     """Лиды."""
     conn = get_db()
     if since:
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT l.*, c.name as contact_name FROM leads l
             JOIN contacts c ON l.contact_id = c.id
             WHERE l.created_at >= ?
             ORDER BY l.created_at DESC
-        """, (since,)).fetchall()
+        """,
+            (since,),
+        ).fetchall()
     else:
         rows = conn.execute("""
             SELECT l.*, c.name as contact_name FROM leads l
@@ -926,11 +897,26 @@ def crm_daily_summary(date=None):
 
     result = {
         "date": date,
-        "messages": conn.execute("SELECT COUNT(*) as cnt FROM messages WHERE sent_at BETWEEN ? AND ?", (start, end)).fetchone()["cnt"],
-        "new_leads": conn.execute("SELECT COUNT(*) as cnt FROM leads WHERE created_at BETWEEN ? AND ?", (start, end)).fetchone()["cnt"],
-        "new_tasks": conn.execute("SELECT COUNT(*) as cnt FROM tasks WHERE created_at BETWEEN ? AND ?", (start, end)).fetchone()["cnt"],
-        "completed_tasks": conn.execute("SELECT COUNT(*) as cnt FROM tasks WHERE status = 'done' AND updated_at BETWEEN ? AND ?", (start, end)).fetchone()["cnt"],
-        "memories": conn.execute("SELECT COUNT(*) as cnt FROM memories WHERE created_at BETWEEN ? AND ?", (start, end)).fetchone()["cnt"],
+        "messages": conn.execute(
+            "SELECT COUNT(*) as cnt FROM messages WHERE sent_at BETWEEN ? AND ?",
+            (start, end),
+        ).fetchone()["cnt"],
+        "new_leads": conn.execute(
+            "SELECT COUNT(*) as cnt FROM leads WHERE created_at BETWEEN ? AND ?",
+            (start, end),
+        ).fetchone()["cnt"],
+        "new_tasks": conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE created_at BETWEEN ? AND ?",
+            (start, end),
+        ).fetchone()["cnt"],
+        "completed_tasks": conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE status = 'done' AND updated_at BETWEEN ? AND ?",
+            (start, end),
+        ).fetchone()["cnt"],
+        "memories": conn.execute(
+            "SELECT COUNT(*) as cnt FROM memories WHERE created_at BETWEEN ? AND ?",
+            (start, end),
+        ).fetchone()["cnt"],
     }
     conn.close()
     return result
@@ -938,13 +924,14 @@ def crm_daily_summary(date=None):
 
 # === INGEST (полный пайплайн) ===
 
+
 def _content_hash(text):
     """SHA-256 хэш контента для дедупликации."""
-    return hashlib.sha256(text.strip().encode('utf-8')).hexdigest()[:16]
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
 
 
 def ingest(text, contact_id=None, chat_thread_id=None, source_message_id=None):
-    """Полный пайплайн: classify → extract → store → chaos."""
+    """Полный пайплайн: classify → extract → store."""
     try:
         from brain import classify_message, extract_entities
     except ImportError:
@@ -966,12 +953,16 @@ def ingest(text, contact_id=None, chat_thread_id=None, source_message_id=None):
     if source_message_id:
         existing_msg = conn.execute(
             "SELECT id FROM memories WHERE source_message_id = ? AND chat_thread_id = ?",
-            (source_message_id, chat_thread_id)
+            (source_message_id, chat_thread_id),
         ).fetchone()
         if existing_msg:
             conn.close()
             print(f"⏭️ Дубликат (source_message_id={source_message_id}), пропускаю")
-            return {"label": "duplicate", "skipped": True, "existing_id": existing_msg["id"]}
+            return {
+                "label": "duplicate",
+                "skipped": True,
+                "existing_id": existing_msg["id"],
+            }
     conn.close()
 
     # 1. Классификация
@@ -991,20 +982,12 @@ def ingest(text, contact_id=None, chat_thread_id=None, source_message_id=None):
             content=f"[{label}] {text[:200]}",
             mem_type="episodic",
             importance=importance,
+            category=label,
             contact_id=contact_id,
             chat_thread_id=chat_thread_id,
             source_message_id=source_message_id,
             content_hash=content_hash,
             auto_associate=True,
-        )
-
-        # 4. CHAOS store
-        chaos_store(
-            content=text[:200],
-            category=label,
-            priority=importance,
-            memory_id=mid,
-            contact_id=contact_id,
         )
         result["stored"] = True
         result["memory_id"] = mid
@@ -1017,12 +1000,15 @@ def ingest(text, contact_id=None, chat_thread_id=None, source_message_id=None):
 
 # === CONTEXT ===
 
+
 def context(query, contact_id=None, deal_id=None, intent="search"):
     """Собрать контекст-пакет для LLM."""
     try:
         from brain import build_context_packet
-        packet = build_context_packet(query, contact_id=contact_id,
-                                     deal_id=deal_id, intent=intent)
+
+        packet = build_context_packet(
+            query, contact_id=contact_id, deal_id=deal_id, intent=intent
+        )
         return packet
     except ImportError:
         print("Модуль brain.py не найден")
@@ -1031,10 +1017,12 @@ def context(query, contact_id=None, deal_id=None, intent="search"):
 
 # === DIGEST ===
 
+
 def digest(date=None):
     """Утренний дайджест."""
     try:
         from brain import generate_daily_digest
+
         return generate_daily_digest(date)
     except ImportError:
         print("Модуль brain.py не найден")
@@ -1045,6 +1033,7 @@ def weekly():
     """Недельный дайджест."""
     try:
         from brain import generate_weekly_digest
+
         return generate_weekly_digest()
     except ImportError:
         print("Модуль brain.py не найден")
@@ -1053,10 +1042,11 @@ def weekly():
 
 # === MAINTENANCE ===
 
+
 def consolidate():
     """
     Консолидация памяти: decay + cluster (vec ANN) + merge + RAPTOR + cleanup.
-    
+
     Архитектурное решение: вместо O(n²) brute-force сравнения всех пар,
     используем sqlite-vec ANN для поиска top-K соседей каждого memory.
     500 записей × 10 соседей × 0.24мс = 1.2с вместо 46 минут.
@@ -1110,14 +1100,17 @@ def consolidate():
                 vec_blob = vec_to_blob(vec)
 
                 try:
-                    neighbors = conn.execute("""
+                    neighbors = conn.execute(
+                        """
                         SELECT vm.rowid as nid, m.content, m.type, m.importance,
                                distance
                         FROM vec_memories vm
                         JOIN memories m ON vm.rowid = m.id
                         WHERE vm.embedding MATCH ? AND k = 11
                         ORDER BY distance
-                    """, (vec_blob,)).fetchall()
+                    """,
+                        (vec_blob,),
+                    ).fetchall()
                 except Exception:
                     continue
 
@@ -1145,16 +1138,22 @@ def consolidate():
                         keep_id, drop_id = nid, mid
 
                     # Переносим ассоциации с drop на keep
-                    conn.execute("""
+                    conn.execute(
+                        """
                         UPDATE associations
                         SET memory_id_from = ?
                         WHERE memory_id_from = ? AND memory_id_to != ?
-                    """, (keep_id, drop_id, keep_id))
-                    conn.execute("""
+                    """,
+                        (keep_id, drop_id, keep_id),
+                    )
+                    conn.execute(
+                        """
                         UPDATE associations
                         SET memory_id_to = ?
                         WHERE memory_id_to = ? AND memory_id_from != ?
-                    """, (keep_id, drop_id, keep_id))
+                    """,
+                        (keep_id, drop_id, keep_id),
+                    )
 
                     # Удаляем memory
                     conn.execute("DELETE FROM memories WHERE id = ?", (drop_id,))
@@ -1176,11 +1175,12 @@ def consolidate():
         # но с лимитом — только последние 50 записей (чтобы не зависнуть)
         try:
             from brain import similarity as _sim
+
             small_set = memories[:50]
             processed_pairs = set()
 
             for i, m1 in enumerate(small_set):
-                for m2 in small_set[i+1:]:
+                for m2 in small_set[i + 1 :]:
                     pair_key = (min(m1["id"], m2["id"]), max(m1["id"], m2["id"]))
                     if pair_key in processed_pairs:
                         continue
@@ -1195,10 +1195,12 @@ def consolidate():
 
                         conn.execute(
                             "UPDATE associations SET memory_id_from = ? WHERE memory_id_from = ? AND memory_id_to != ?",
-                            (keep_id, drop_id, keep_id))
+                            (keep_id, drop_id, keep_id),
+                        )
                         conn.execute(
                             "UPDATE associations SET memory_id_to = ? WHERE memory_id_to = ? AND memory_id_from != ?",
-                            (keep_id, drop_id, keep_id))
+                            (keep_id, drop_id, keep_id),
+                        )
                         conn.execute("DELETE FROM memories WHERE id = ?", (drop_id,))
                         merged_count += 1
 
@@ -1210,6 +1212,7 @@ def consolidate():
     cluster_count = 0
     try:
         from brain import auto_associate as _auto_assoc
+
         recent = conn.execute("""
             SELECT id, content FROM memories
             WHERE created_at > datetime('now', '-30 days')
@@ -1226,6 +1229,7 @@ def consolidate():
     raptor_count = 0
     try:
         from brain import build_raptor
+
         raptor_count = build_raptor(level=0, batch_size=8)
         build_raptor(level=1, batch_size=5)
     except ImportError:
@@ -1240,8 +1244,10 @@ def consolidate():
     deleted = 0
     for row in weak_ids:
         conn.execute("DELETE FROM vec_memories WHERE rowid = ?", (row["id"],))
-        conn.execute("DELETE FROM associations WHERE memory_id_from = ? OR memory_id_to = ?",
-                    (row["id"], row["id"]))
+        conn.execute(
+            "DELETE FROM associations WHERE memory_id_from = ? OR memory_id_to = ?",
+            (row["id"], row["id"]),
+        )
         conn.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
         deleted += 1
 
@@ -1270,13 +1276,27 @@ def stats():
     """Статистика базы данных."""
     conn = get_db()
     tables = [
-        "contacts", "companies", "chat_threads", "messages",
-        "leads", "deals", "tasks", "agreements", "invoices", "payments",
-        "memories", "associations", "raptor_nodes", "chaos_entries"
+        "contacts",
+        "companies",
+        "chat_threads",
+        "messages",
+        "leads",
+        "deals",
+        "tasks",
+        "agreements",
+        "invoices",
+        "payments",
+        "memories",
+        "associations",
+        "raptor_nodes",
     ]
     print("📊 Lenochka Memory v2 — Статистика:")
     print(f"   БД: {DB_PATH}")
-    print(f"   Размер: {DB_PATH.stat().st_size / 1024:.1f} KB" if DB_PATH.exists() else "   (не создана)")
+    print(
+        f"   Размер: {DB_PATH.stat().st_size / 1024:.1f} KB"
+        if DB_PATH.exists()
+        else "   (не создана)"
+    )
     print()
     for t in tables:
         try:
@@ -1289,9 +1309,10 @@ def stats():
     try:
         conn.enable_load_extension(True)
         import sqlite_vec
+
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
-        for vt in ["vec_memories", "vec_chaos"]:
+        for vt in ["vec_memories"]:
             try:
                 row = conn.execute(f"SELECT COUNT(*) as cnt FROM {vt}").fetchone()
                 print(f"   {vt:25s} → {row['cnt']} векторов")
@@ -1302,7 +1323,103 @@ def stats():
     conn.close()
 
 
+# === IMPORT BATCH ===
+
+
+def import_batch(
+    messages: list[dict],
+    contact_id: int | None,
+    chat_thread_id: int,
+) -> dict:
+    """
+    Batch-import parsed messages into the database.
+
+    messages: [{"from_name": str, "text": str, "date": str, "has_reply": bool}, ...]
+    Returns: {"messages_inserted": int, "memories_created": int}
+    """
+    conn = get_db()
+    messages_inserted = 0
+    memories_created = 0
+
+    try:
+        for msg in messages:
+            from_name = msg.get("from_name", "Unknown")
+            text = msg.get("text", "")
+            date_str = msg.get("date", datetime.now().isoformat())
+
+            conn.execute(
+                """INSERT INTO messages
+                   (chat_thread_id, from_user_id, text, sent_at,
+                    content_hash, analyzed, classification)
+                   VALUES (?, ?, ?, ?, ?, 1, 'chit-chat')""",
+                (
+                    chat_thread_id,
+                    from_name,
+                    text[:4096],
+                    date_str[:19] if len(date_str) > 19 else date_str,
+                    hashlib.sha256(
+                        f"{from_name}:{text}:{date_str}".encode()
+                    ).hexdigest()[:16],
+                ),
+            )
+            messages_inserted += 1
+            msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            if text.strip():
+                content_hash = hashlib.sha256(text.encode()).hexdigest()
+
+                existing = conn.execute(
+                    "SELECT id FROM memories WHERE content_hash=?", (content_hash,)
+                ).fetchone()
+                if existing:
+                    continue
+
+                conn.execute(
+                    """INSERT INTO memories
+                       (content, content_hash, type, importance, strength,
+                        contact_id, chat_thread_id, source_message_id)
+                       VALUES (?, ?, 'episodic', 0.3, 1.0, ?, ?, ?)""",
+                    (text, content_hash, contact_id, chat_thread_id, msg_id),
+                )
+                memories_created += 1
+                mem_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                try:
+                    conn.execute(
+                        "INSERT INTO memories_fts(rowid, content, category) VALUES (?, ?, ?)",
+                        (mem_id, text, "import"),
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    conn.execute(
+                        """INSERT INTO chaos_entries
+                           (memory_id, content, category, timestamp)
+                           VALUES (?, ?, 'import', ?)""",
+                        (
+                            mem_id,
+                            text[:200],
+                            date_str[:19] if len(date_str) > 19 else date_str,
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise
+
+    conn.close()
+    return {
+        "messages_inserted": messages_inserted,
+        "memories_created": memories_created,
+    }
+
+
 # === CLI PARSER ===
+
 
 def main():
     if len(sys.argv) < 2:
@@ -1331,7 +1448,9 @@ def main():
 
     elif cmd == "store":
         if not args:
-            print('Usage: mem.py store "content" [--type episodic] [--importance 0.7] ...')
+            print(
+                'Usage: mem.py store "content" [--type episodic] [--importance 0.7] ...'
+            )
             sys.exit(1)
         content = args[0]
         store(
@@ -1339,15 +1458,21 @@ def main():
             mem_type=get_arg("type", "episodic"),
             importance=float(get_arg("importance", "0.5")),
             contact_id=int(get_arg("contact-id")) if get_arg("contact-id") else None,
-            chat_thread_id=int(get_arg("chat-thread-id")) if get_arg("chat-thread-id") else None,
+            chat_thread_id=int(get_arg("chat-thread-id"))
+            if get_arg("chat-thread-id")
+            else None,
             deal_id=int(get_arg("deal-id")) if get_arg("deal-id") else None,
-            source_message_id=int(get_arg("source-message-id")) if get_arg("source-message-id") else None,
+            source_message_id=int(get_arg("source-message-id"))
+            if get_arg("source-message-id")
+            else None,
             tags=json.loads(get_arg("tags")) if get_arg("tags") else None,
         )
 
     elif cmd == "recall":
         if not args:
-            print('Usage: mem.py recall "query" [--strategy hybrid] [--contact-id N] ...')
+            print(
+                'Usage: mem.py recall "query" [--strategy hybrid] [--contact-id N] ...'
+            )
             sys.exit(1)
         query = args[0]
         results = recall(
@@ -1369,37 +1494,11 @@ def main():
         )
         print(json.dumps(results, ensure_ascii=False, indent=2))
 
-    elif cmd == "chaos-store":
-        if not args:
-            print('Usage: mem.py chaos-store "content" [--category decision] [--priority 0.8]')
-            sys.exit(1)
-        content = args[0]
-        chaos_store(
-            content=content,
-            category=get_arg("category", "other"),
-            priority=float(get_arg("priority", "0.5")),
-            memory_id=int(get_arg("memory-id")) if get_arg("memory-id") else None,
-            contact_id=int(get_arg("contact-id")) if get_arg("contact-id") else None,
-        )
-
-    elif cmd == "chaos-search":
-        if not args:
-            print('Usage: mem.py chaos-search "query" [--mode index|full] [--limit 10]')
-            sys.exit(1)
-        query = args[0]
-        results = chaos_search(
-            query=query,
-            mode=get_arg("mode", "index"),
-            limit=int(get_arg("limit", "10")),
-        )
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-
-    elif cmd == "chaos-reindex":
-        chaos_reindex()
-
     elif cmd == "crm":
         if len(args) < 1:
-            print("Usage: mem.py crm <contact|deals|overdue-tasks|abandoned|leads|daily-summary> [options]")
+            print(
+                "Usage: mem.py crm <contact|deals|overdue-tasks|abandoned|leads|daily-summary> [options]"
+            )
             sys.exit(1)
         sub = args[0]
         sub_args = args[1:]
@@ -1413,34 +1512,64 @@ def main():
         if sub == "contact":
             result = crm_contact(
                 tg=sub_arg("tg"),
-                contact_id=int(sub_arg("contact-id")) if sub_arg("contact-id") else None,
+                contact_id=int(sub_arg("contact-id"))
+                if sub_arg("contact-id")
+                else None,
             )
-            print(json.dumps(result, ensure_ascii=False, indent=2) if result else "Не найден")
+            print(
+                json.dumps(result, ensure_ascii=False, indent=2)
+                if result
+                else "Не найден"
+            )
         elif sub == "deals":
             cid = int(sub_arg("contact-id")) if sub_arg("contact-id") else None
             print(json.dumps(crm_deals(contact_id=cid), ensure_ascii=False, indent=2))
         elif sub == "overdue-tasks":
             print(json.dumps(crm_overdue_tasks(), ensure_ascii=False, indent=2))
         elif sub == "abandoned":
-            print(json.dumps(crm_abandoned(hours=int(sub_arg("hours", "24"))), ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    crm_abandoned(hours=int(sub_arg("hours", "24"))),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         elif sub == "leads":
-            print(json.dumps(crm_leads(since=sub_arg("since")), ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    crm_leads(since=sub_arg("since")), ensure_ascii=False, indent=2
+                )
+            )
         elif sub == "daily-summary":
-            print(json.dumps(crm_daily_summary(date=sub_arg("date")), ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    crm_daily_summary(date=sub_arg("date")),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         else:
             print(f"Неизвестная CRM-команда: {sub}")
             sys.exit(1)
 
     elif cmd == "ingest":
         if not args:
-            print('Usage: mem.py ingest "текст сообщения" [--contact-id N] [--chat-thread-id N] [--source-message-id N]')
+            print(
+                'Usage: mem.py ingest "текст сообщения" [--contact-id N] [--chat-thread-id N] [--source-message-id N]'
+            )
             sys.exit(1)
         text = " ".join(args)
         contact_id = int(get_arg("contact-id")) if get_arg("contact-id") else None
-        chat_thread_id = int(get_arg("chat-thread-id")) if get_arg("chat-thread-id") else None
+        chat_thread_id = (
+            int(get_arg("chat-thread-id")) if get_arg("chat-thread-id") else None
+        )
         source_message_id = get_arg("source-message-id")
-        result = ingest(text, contact_id=contact_id, chat_thread_id=chat_thread_id,
-                       source_message_id=source_message_id)
+        result = ingest(
+            text,
+            contact_id=contact_id,
+            chat_thread_id=chat_thread_id,
+            source_message_id=source_message_id,
+        )
         if result:
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -1471,9 +1600,15 @@ def main():
         text = " ".join(args)
         try:
             from brain import classify_message
+
             label, conf, reason = classify_message(text)
-            print(json.dumps({"label": label, "confidence": conf, "reasoning": reason},
-                           ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {"label": label, "confidence": conf, "reasoning": reason},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         except ImportError:
             print("Модуль brain.py не найден")
 
@@ -1484,6 +1619,7 @@ def main():
         text = " ".join(args)
         try:
             from brain import extract_entities
+
             entities = extract_entities(text)
             print(json.dumps(entities, ensure_ascii=False, indent=2))
         except ImportError:
@@ -1496,6 +1632,25 @@ def main():
         days = int(get_arg("older-than", "180"))
         prune_messages(older_than_days=days)
 
+    elif cmd == "import-batch":
+        if not args:
+            print(
+                "Usage: mem.py import-batch --file messages.json --contact-id N --chat-thread-id N"
+            )
+            sys.exit(1)
+        file_path = get_arg("file")
+        contact_id = int(get_arg("contact-id")) if get_arg("contact-id") else None
+        chat_thread_id = (
+            int(get_arg("chat-thread-id")) if get_arg("chat-thread-id") else None
+        )
+        if not file_path:
+            print("Error: --file is required")
+            sys.exit(1)
+        with open(file_path, "r", encoding="utf-8") as f:
+            messages = json.load(f)
+        result = import_batch(messages, contact_id, chat_thread_id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
     elif cmd == "stats":
         stats()
 
@@ -1503,6 +1658,7 @@ def main():
         level = int(get_arg("level", "0"))
         try:
             from brain import build_raptor
+
             count = build_raptor(level=level)
             print(f"✅ Создано {count} RAPTOR-нод на уровне {level}")
         except ImportError:
