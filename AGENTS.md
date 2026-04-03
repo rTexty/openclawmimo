@@ -119,6 +119,10 @@ Pipeline возвращает:
 - **Пустой stdout** → SILENT (ничего не отправлять)
 - **Текст в stdout** → отправить этот текст в Telegram
 - **[NATURAL_RESPONSE]** → это сообщение от owner'а в личку. Отвечай естественно, как ассистент — используя SOUL.md, USER.md, MEMORY.md. Не отправляй "[NATURAL_RESPONSE]" в Telegram!
+  - Это может быть просто разговор, шутка, вопрос не по бизнесу
+  - Не пытайся найти бизнес-контекст в каждом сообщении
+  - Не задавай уточняющих вопросов типа "Можешь уточнить?" — отвечай прямо или поддержи беседу
+  - Если не понял — ответь честно, но без формализма
 
 Я вывожу ТОЛЬКО то, что вернул pipeline. Ничего больше.
 
@@ -197,10 +201,10 @@ python3 skills/lenochka-load/run_load.py \
 3. Owner пишет `Готово` → запускается импорт → результат в Telegram
 
 **ВАЖНО: При получении файла во время load-сессии:**
-1. Если видишь в контексте сообщения локальный путь к файлу (media path) — скопируй его в `/tmp/lenochka_load/{chat_id}/`
-2. Если путь недоступен — скажи пользователю: "Положи файл вручную в /tmp/lenochka_load/{chat_id}/ и напиши Готово"
-3. Затем запусти pipeline с `--content_type document --text "{filename}"`
-4. Отправь ответ pipeline в Telegram
+- OpenClaw скачивает файл и показывает путь в сообщении: `<media:document> (file: result.json, path: /path/to/file)`
+- Скопируй файл из указанного `path` в `/tmp/lenochka_load/{chat_id}/`
+- Затем запусти pipeline с `--content_type document --text "{filename}"`
+- Отправь ответ pipeline в Telegram
 
 Результат: контакты, chat_threads, messages, memories созданы автоматически.
 
