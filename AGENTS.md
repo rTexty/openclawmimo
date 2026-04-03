@@ -193,8 +193,14 @@ python3 skills/lenochka-load/run_load.py \
 
 Поток через бота:
 1. Owner пишет `/load` → создаётся load_session
-2. Owner загружает файлы → сохраняются в /tmp/lenochka_load/{chat_id}/
+2. Owner загружает файлы → **АГЕНТ должен скачать файл из Telegram и сохранить в /tmp/lenochka_load/{chat_id}/**
 3. Owner пишет `Готово` → запускается импорт → результат в Telegram
+
+**ВАЖНО: При получении файла во время load-сессии:**
+1. Если видишь в контексте сообщения локальный путь к файлу (media path) — скопируй его в `/tmp/lenochka_load/{chat_id}/`
+2. Если путь недоступен — скажи пользователю: "Положи файл вручную в /tmp/lenochka_load/{chat_id}/ и напиши Готово"
+3. Затем запусти pipeline с `--content_type document --text "{filename}"`
+4. Отправь ответ pipeline в Telegram
 
 Результат: контакты, chat_threads, messages, memories созданы автоматически.
 

@@ -450,7 +450,9 @@ def handle_load_command(conn, chat_id: str, sender_id: int) -> str | None:
     return "📎 Жду файлы. Загрузи JSON или HTML экспорт Telegram."
 
 
-def handle_load_file(conn, chat_id: str, sender_id: int, filename: str) -> str | None:
+def handle_load_file(
+    conn, chat_id: str, sender_id: int, filename: str, source_path: str | None = None
+) -> str | None:
     """Обработать загрузку файла во время load-сессии."""
     if str(sender_id) != OWNER_ID:
         return None
@@ -467,6 +469,14 @@ def handle_load_file(conn, chat_id: str, sender_id: int, filename: str) -> str |
 
     files_dir = LOAD_DIR_BASE / chat_id
     files_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy downloaded file from OpenClaw temp to load directory
+    if source_path and Path(source_path).exists():
+        dest = files_dir / filename
+        import shutil
+
+        shutil.copy2(source_path, dest)
+        log(f"load: copied {source_path} → {dest}")
 
     conn.execute(
         "UPDATE load_sessions SET status='ready_to_process', files_path=?, updated_at=datetime('now') WHERE id=?",
@@ -761,7 +771,9 @@ def run_pipeline(args) -> str | None:
             ).fetchone()
             if session:
                 filename = args.text[:100] if args.text else "file"
-                return handle_load_file(conn, args.chat_id, args.sender_id, filename)
+                return handle_load_file(
+                    conn, args.chat_id, args.sender_id, filename, args.file_path
+                )
 
         contact_id = resolve_contact(
             conn, args.sender_id, args.sender_name, args.tg_username
@@ -962,6 +974,7 @@ def build_parser():
     p.add_argument("--reply_to_text", default=None)
     p.add_argument("--reply_to_author", default=None)
     p.add_argument("--forward_from", default=None)
+    p.add_argument("--file_path", default=None, help="Local path to downloaded file")
     return p
 
 
