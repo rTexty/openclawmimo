@@ -118,6 +118,7 @@ python3 skills/lenochka-pipeline/run_pipeline.py \
 Pipeline возвращает:
 - **Пустой stdout** → SILENT (ничего не отправлять)
 - **Текст в stdout** → отправить этот текст в Telegram
+- **[NATURAL_RESPONSE]** → это сообщение от owner'а в личку. Отвечай естественно, как ассистент — используя SOUL.md, USER.md, MEMORY.md. Не отправляй "[NATURAL_RESPONSE]" в Telegram!
 
 Я вывожу ТОЛЬКО то, что вернул pipeline. Ничего больше.
 

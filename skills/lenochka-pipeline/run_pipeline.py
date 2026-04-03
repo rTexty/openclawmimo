@@ -374,22 +374,13 @@ def decide_response(
     if is_owner and lower == "/load":
         return handle_load_command(conn, chat_id, int(OWNER_ID))
 
-    # Owner в bot_dm → всегда отвечать, никогда не молчать
+    # Owner в bot_dm → агент отвечает естественно через LLM
     is_bot_dm = is_owner and event_type in ("message", "direct_message")
+    if is_bot_dm:
+        # Сохраняем сообщение в БД, но не решаем за LLM
+        return "[NATURAL_RESPONSE]"
 
     if label in SILENT_LABELS:
-        if is_bot_dm:
-            # Owner пишет в личку — попытаться найти что-то в памяти
-            try:
-                buf = __import__("io").StringIO()
-                with __import__("contextlib").redirect_stdout(buf):
-                    results = mem.recall(query=text, limit=3)
-                if results and len(results) > 0:
-                    snippets = [r.get("content", "")[:200] for r in results[:2]]
-                    return "Вот что нашла по запросу:\n" + "\n---\n".join(snippets)
-            except Exception:
-                pass
-            return "Не нашла ничего конкретного в памяти. Спроси иначе."
         return None
 
     is_complaint = label == "risk"
