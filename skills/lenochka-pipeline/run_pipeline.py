@@ -367,6 +367,7 @@ def decide_response(
     contact_name: str,
     text: str,
     event_type: str = "message",
+    has_business_connection: bool = False,
 ) -> str | None:
     """Решить: ответить фактом, эскалировать, или молчать."""
     lower = text.strip().lower()
@@ -374,10 +375,14 @@ def decide_response(
     if is_owner and lower == "/load":
         return handle_load_command(conn, chat_id, int(OWNER_ID))
 
-    # Owner в bot_dm → агент отвечает естественно через LLM
-    is_bot_dm = is_owner and event_type in ("message", "direct_message")
-    if is_bot_dm:
-        # Сохраняем сообщение в БД, но не решаем за LLM
+    # Owner в bot_dm (напрямую боту) → агент отвечает естественно через LLM
+    # Owner в business_dm (пишет клиенту) → НЕ отвечать, это не к Леночке
+    is_owner_bot_dm = (
+        is_owner
+        and event_type in ("message", "direct_message")
+        and not has_business_connection
+    )
+    if is_owner_bot_dm:
         return "[NATURAL_RESPONSE]"
 
     if label in SILENT_LABELS:
@@ -898,6 +903,7 @@ def run_pipeline(args) -> str | None:
             contact_name,
             text,
             event_type,
+            bool(getattr(args, "business_connection_id", None)),
         )
 
         conn.execute(
