@@ -366,6 +366,7 @@ def decide_response(
     is_owner: bool,
     contact_name: str,
     text: str,
+    event_type: str = "message",
 ) -> str | None:
     """Решить: ответить фактом, эскалировать, или молчать."""
     lower = text.strip().lower()
@@ -373,7 +374,13 @@ def decide_response(
     if is_owner and lower == "/load":
         return handle_load_command(conn, chat_id, int(OWNER_ID))
 
+    # Owner в bot_dm → всегда отвечать, никогда не молчать
+    is_bot_dm = is_owner and event_type in ("message", "direct_message")
+
     if label in SILENT_LABELS:
+        if is_bot_dm:
+            # Owner пишет в личку — ответить что-нибудь
+            return "Поняла тебя."
         return None
 
     is_complaint = label == "risk"
@@ -878,6 +885,7 @@ def run_pipeline(args) -> str | None:
             is_owner,
             contact_name,
             text,
+            event_type,
         )
 
         conn.execute(
