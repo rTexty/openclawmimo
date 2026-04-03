@@ -379,8 +379,17 @@ def decide_response(
 
     if label in SILENT_LABELS:
         if is_bot_dm:
-            # Owner пишет в личку — ответить что-нибудь
-            return "Поняла тебя."
+            # Owner пишет в личку — попытаться найти что-то в памяти
+            try:
+                buf = __import__("io").StringIO()
+                with __import__("contextlib").redirect_stdout(buf):
+                    results = mem.recall(query=text, limit=3)
+                if results and len(results) > 0:
+                    snippets = [r.get("content", "")[:200] for r in results[:2]]
+                    return "Вот что нашла по запросу:\n" + "\n---\n".join(snippets)
+            except Exception:
+                pass
+            return "Не нашла ничего конкретного в памяти. Спроси иначе."
         return None
 
     is_complaint = label == "risk"
