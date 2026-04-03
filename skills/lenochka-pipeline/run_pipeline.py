@@ -383,7 +383,61 @@ def decide_response(
         and not has_business_connection
     )
     if is_owner_bot_dm:
-        return "[NATURAL_RESPONSE]"
+        # Инжектим контекст для ассистента
+        context_lines = []
+
+        # Просроченные задачи
+        try:
+            overdue = conn.execute(
+                "SELECT t.description, c.name, t.due_at "
+                "FROM tasks t LEFT JOIN contacts c ON t.contact_id = c.id "
+                "WHERE t.due_at < datetime('now') AND t.status NOT IN ('done','cancelled') "
+                "ORDER BY t.due_at ASC LIMIT 3"
+            ).fetchall()
+            if overdue:
+                context_lines.append("Просроченные задачи:")
+                for t in overdue:
+                    who = f" ({t['name']})" if t["name"] else ""
+                    context_lines.append(f"  - {t['description']}{who}")
+        except Exception:
+            pass
+
+        # Непросмотренные сообщения
+        try:
+            unseen = conn.execute(
+                "SELECT COUNT(*) as cnt FROM messages WHERE analyzed = 0"
+            ).fetchone()
+            if unseen and unseen["cnt"] > 0:
+                context_lines.append(f"Непросмотренных сообщений: {unseen['cnt']}")
+        except Exception:
+            pass
+
+        # Ближайшие дедлайны
+        try:
+            soon = conn.execute(
+                "SELECT t.description, c.name, t.due_at "
+                "FROM tasks t LEFT JOIN contacts c ON t.contact_id = c.id "
+                "WHERE t.due_at BETWEEN datetime('now') AND datetime('now', '+24 hours') "
+                "AND t.status NOT IN ('done','cancelled') "
+                "ORDER BY t.due_at ASC LIMIT 3"
+            ).fetchall()
+            if soon:
+                context_lines.append("Скоро дедлайн:")
+                for t in soon:
+                    who = f" ({t['name']})" if t["name"] else ""
+                    context_lines.append(
+                        f"  - {t['description']}{who} — до {t['due_at'][:16]}"
+                    )
+        except Exception:
+            pass
+
+        context_block = (
+            "\n".join(context_lines)
+            if context_lines
+            else "Всё спокойно — задач и сообщений нет."
+        )
+
+        return f"[NATURAL_RESPONSE]\n\nКонтекст для ассистента:\n{context_block}"
 
     if label in SILENT_LABELS:
         return None
@@ -682,14 +736,19 @@ def store_message(
 
 def is_duplicate(conn, chat_thread_id, source_msg_id):
     if source_msg_id is None:
+        log(f"dedup: source_msg_id is None")
         return False
+    log(
+        f"dedup: checking chat_thread_id={chat_thread_id} source_msg_id={source_msg_id}"
+    )
     row = conn.execute(
         "SELECT id FROM messages WHERE chat_thread_id=? AND source_msg_id=?",
         (chat_thread_id, source_msg_id),
     ).fetchone()
     if row:
-        log(f"dedup: source_msg_id={source_msg_id} exists")
+        log(f"dedup: source_msg_id={source_msg_id} exists (row id={row['id']})")
         return True
+    log(f"dedup: not found")
     return False
 
 
