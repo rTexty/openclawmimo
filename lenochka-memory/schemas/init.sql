@@ -344,3 +344,22 @@ CREATE TABLE IF NOT EXISTS failed_messages (
 
 CREATE INDEX IF NOT EXISTS idx_failed_messages_resolved
     ON failed_messages(resolved, created_at);
+
+-- ============================================
+-- Pipeline Observability
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage       TEXT NOT NULL,
+    status      TEXT NOT NULL,       -- ok / error / skip
+    duration_ms INTEGER NOT NULL,
+    message_id  INTEGER,
+    error       TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_stage
+    ON pipeline_runs(stage, created_at);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_created
+    ON pipeline_runs(created_at);

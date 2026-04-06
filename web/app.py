@@ -101,6 +101,27 @@ def api_tasks():
         conn.close()
 
 
+@app.route("/api/pipeline-health")
+def api_pipeline_health():
+    """Latency по стадиям за последние 24 часа."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT stage, status, "
+            "COUNT(*) as total, "
+            "AVG(duration_ms) as avg_ms, "
+            "MAX(duration_ms) as max_ms, "
+            "SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as errors "
+            "FROM pipeline_runs "
+            "WHERE created_at >= datetime('now', '-24 hours') "
+            "GROUP BY stage, status "
+            "ORDER BY stage"
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
 @app.route("/api/failed-messages")
 def api_failed_messages():
     limit = request.args.get("limit", 50, type=int)

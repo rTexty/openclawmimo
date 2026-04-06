@@ -23,6 +23,8 @@ import json
 import re
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -179,6 +181,39 @@ def store_dlq_failure(raw_payload: str, stage: str, error: str) -> None:
             conn.close()
     except Exception as dlq_err:
         log(f"DLQ write failed: {dlq_err}")
+
+
+def record_stage(
+    stage: str, status: str, duration_ms: int, message_id: int | None = None, error: str | None = None
+) -> None:
+    """Записать результат шага пайплайна в pipeline_runs."""
+    try:
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO pipeline_runs (stage, status, duration_ms, message_id, error) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (stage, status, duration_ms, message_id, error),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        log(f"observability write failed: {e}")
+
+
+@contextmanager
+def timed_stage(stage: str, message_id: int | None = None):
+    """Context manager: замеряет время шага и пишет в pipeline_runs."""
+    t0 = time.monotonic()
+    try:
+        yield
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        record_stage(stage, "ok", duration_ms, message_id)
+    except Exception as e:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        record_stage(stage, "error", duration_ms, message_id, str(e)[:500])
+        raise
 
 
 def _run_crm(*args: str) -> str:
@@ -867,15 +902,16 @@ def run_pipeline(args) -> str | None:
         from_user = (
             str(args.sender_id) if args.sender_id else ("self" if is_owner else None)
         )
-        msg_id = store_message(
-            conn,
-            chat_thread_id,
-            from_user,
-            text,
-            args.message_id,
-            chash,
-            args.content_type,
-        )
+        with timed_stage("store"):
+            msg_id = store_message(
+                conn,
+                chat_thread_id,
+                from_user,
+                text,
+                args.message_id,
+                chash,
+                args.content_type,
+            )
 
         if action == "silent_ingest":
             conn.execute(
@@ -893,7 +929,8 @@ def run_pipeline(args) -> str | None:
             conn.commit()
             return None
 
-        result = ingest(text, contact_id, chat_thread_id, msg_id)
+        with timed_stage("ingest", msg_id):
+            result = ingest(text, contact_id, chat_thread_id, msg_id)
         label = result.get("label", "other")
         confidence = float(result.get("confidence", 0.5))
         entities = result.get("entities") or {}
@@ -915,44 +952,45 @@ def run_pipeline(args) -> str | None:
                 for a in entities.get("amounts", [])
                 if isinstance(a, (int, float))
             ]
-            if amounts and label in ("decision", "lead-signal"):
-                stage = "closed_won" if label == "decision" else "discovery"
-                _run_crm(
-                    "deal",
-                    "--contact_id",
-                    str(contact_id),
-                    "--amount",
-                    str(max(amounts)),
-                    "--stage",
-                    stage,
-                )
+            with timed_stage("crm", msg_id):
+                if amounts and label in ("decision", "lead-signal"):
+                    crm_stage = "closed_won" if label == "decision" else "discovery"
+                    _run_crm(
+                        "deal",
+                        "--contact_id",
+                        str(contact_id),
+                        "--amount",
+                        str(max(amounts)),
+                        "--stage",
+                        crm_stage,
+                    )
 
-            tasks = entities.get("tasks") or []
-            if isinstance(tasks, list):
-                for t in tasks[:3]:
-                    if isinstance(t, dict) and t.get("description"):
-                        _run_crm(
-                            "task",
-                            "--contact_id",
-                            str(contact_id),
-                            "--description",
-                            t["description"],
-                            "--due_date",
-                            t.get("due_date", ""),
-                            "--priority",
-                            t.get("priority", "normal"),
-                        )
+                tasks = entities.get("tasks") or []
+                if isinstance(tasks, list):
+                    for t in tasks[:3]:
+                        if isinstance(t, dict) and t.get("description"):
+                            _run_crm(
+                                "task",
+                                "--contact_id",
+                                str(contact_id),
+                                "--description",
+                                t["description"],
+                                "--due_date",
+                                t.get("due_date", ""),
+                                "--priority",
+                                t.get("priority", "normal"),
+                            )
 
-            if label == "lead-signal":
-                _run_crm(
-                    "lead",
-                    "--contact_id",
-                    str(contact_id),
-                    "--source",
-                    "telegram",
-                    "--amount",
-                    str(max(amounts)) if amounts else "",
-                )
+                if label == "lead-signal":
+                    _run_crm(
+                        "lead",
+                        "--contact_id",
+                        str(contact_id),
+                        "--source",
+                        "telegram",
+                        "--amount",
+                        str(max(amounts)) if amounts else "",
+                    )
 
         contact_row = conn.execute(
             "SELECT name FROM contacts WHERE id=?", (contact_id,)
@@ -961,20 +999,21 @@ def run_pipeline(args) -> str | None:
             contact_row["name"] if contact_row else (args.sender_name or "Клиент")
         )
 
-        response = decide_response(
-            conn,
-            label,
-            confidence,
-            contact_id,
-            chat_thread_id,
-            msg_id,
-            args.chat_id,
-            is_owner,
-            contact_name,
-            text,
-            event_type,
-            bool(getattr(args, "business_connection_id", None)),
-        )
+        with timed_stage("response", msg_id):
+            response = decide_response(
+                conn,
+                label,
+                confidence,
+                contact_id,
+                chat_thread_id,
+                msg_id,
+                args.chat_id,
+                is_owner,
+                contact_name,
+                text,
+                event_type,
+                bool(getattr(args, "business_connection_id", None)),
+            )
 
         conn.execute(
             "UPDATE messages SET analyzed=1, classification=? WHERE id=?",
