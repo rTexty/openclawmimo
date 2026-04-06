@@ -21,13 +21,14 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-TZ_OWNER = timezone(timedelta(hours=8))
 NIGHT_HOUR_START = 23
 NIGHT_HOUR_END = 8
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MEMORY_DIR = PROJECT_ROOT / "lenochka-memory"
 sys.path.insert(0, str(MEMORY_DIR))
+
+from config import TZ_OWNER  # noqa: E402
 
 
 def log(msg: str) -> None:

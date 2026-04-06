@@ -23,7 +23,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 # ── Пути ──────────────────────────────────────────────────────────────────────
@@ -35,15 +35,10 @@ sys.path.insert(0, str(MEMORY_DIR))
 try:
     import mem
     import brain
+    from config import OWNER_ID, BOT_USERNAME, TZ_OWNER, LOAD_DIR_BASE
 except ImportError as e:
     print(f"[pipeline] Import error: {e}", file=sys.stderr)
     sys.exit(1)
-
-# ── Константы ─────────────────────────────────────────────────────────────────
-OWNER_ID = "5944980799"
-TZ_OWNER = timezone(timedelta(hours=8))
-BOT_USERNAME = "lenochkab2b_bot"
-LOAD_DIR_BASE = Path("/tmp/lenochka_load")
 
 SILENT_PHRASES = frozenset(
     {
@@ -868,7 +863,7 @@ def run_pipeline(args) -> str | None:
 
         if action == "silent_ingest":
             conn.execute(
-                "UPDATE messages SET analyzed=1, classification='owner_message' WHERE id=?",
+                "UPDATE messages SET analyzed=1, classification='other' WHERE id=?",
                 (msg_id,),
             )
             conn.commit()

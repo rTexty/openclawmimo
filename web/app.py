@@ -2,14 +2,14 @@
 """Lenochka Web Dashboard — read-only Flask UI for CRM data."""
 
 import sqlite3
+import sys
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request
 
-app = Flask(__name__)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lenochka-memory"))
+from config import DB_PATH  # noqa: E402
 
-DB_PATH = (
-    Path(__file__).resolve().parent.parent / "lenochka-memory" / "db" / "lenochka.db"
-)
+app = Flask(__name__)
 
 
 def get_db():
@@ -23,5 +23,83 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/stats")
+def api_stats():
+    conn = get_db()
+    try:
+        stats = {}
+        for label, sql in [
+            ("Контакты", "SELECT COUNT(*) as c FROM contacts"),
+            ("Сообщения", "SELECT COUNT(*) as c FROM messages"),
+            ("Memories", "SELECT COUNT(*) as c FROM memories"),
+            (
+                "Сделки",
+                "SELECT COUNT(*) as c FROM deals WHERE stage NOT IN ('closed_won','closed_lost')",
+            ),
+            (
+                "Задачи",
+                "SELECT COUNT(*) as c FROM tasks WHERE status NOT IN ('done','cancelled')",
+            ),
+            ("Лиды", "SELECT COUNT(*) as c FROM leads"),
+        ]:
+            row = conn.execute(sql).fetchone()
+            stats[label] = row["c"]
+        return jsonify(stats)
+    finally:
+        conn.close()
+
+
+@app.route("/api/messages")
+def api_messages():
+    limit = request.args.get("limit", 20, type=int)
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT m.text, m.from_user_id, m.sent_at, m.classification, "
+            "c.name as contact_name "
+            "FROM messages m "
+            "LEFT JOIN chat_threads ct ON m.chat_thread_id = ct.id "
+            "LEFT JOIN contacts c ON ct.contact_id = c.id "
+            "ORDER BY m.sent_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route("/api/deals")
+def api_deals():
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT d.stage, d.amount, d.updated_at, c.name as contact_name "
+            "FROM deals d "
+            "LEFT JOIN contacts c ON d.contact_id = c.id "
+            "WHERE d.stage NOT IN ('closed_won','closed_lost') "
+            "ORDER BY d.updated_at DESC"
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route("/api/tasks")
+def api_tasks():
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT t.description, t.due_at, t.status, t.priority, "
+            "c.name as contact_name "
+            "FROM tasks t "
+            "LEFT JOIN contacts c ON t.contact_id = c.id "
+            "WHERE t.status NOT IN ('done','cancelled') "
+            "ORDER BY t.due_at ASC"
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, host="0.0.0.0", port=5001)
