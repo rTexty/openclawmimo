@@ -101,5 +101,35 @@ def api_tasks():
         conn.close()
 
 
+@app.route("/api/failed-messages")
+def api_failed_messages():
+    limit = request.args.get("limit", 50, type=int)
+    resolved = request.args.get("resolved", 0, type=int)
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, stage, error, retry_count, resolved, created_at "
+            "FROM failed_messages WHERE resolved=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (resolved, limit),
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@app.route("/api/failed-messages/<int:msg_id>/resolve", methods=["POST"])
+def api_resolve_failed(msg_id: int):
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE failed_messages SET resolved=1 WHERE id=?", (msg_id,)
+        )
+        conn.commit()
+        return jsonify({"status": "ok"})
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5001)

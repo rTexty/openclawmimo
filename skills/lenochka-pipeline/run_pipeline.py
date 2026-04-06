@@ -165,6 +165,22 @@ def is_night() -> bool:
     return h >= 23 or h < 8
 
 
+def store_dlq_failure(raw_payload: str, stage: str, error: str) -> None:
+    """Записать упавшее сообщение в Dead-Letter Queue."""
+    try:
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO failed_messages (raw_payload, stage, error) VALUES (?, ?, ?)",
+                (raw_payload, stage, str(error)[:2000]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as dlq_err:
+        log(f"DLQ write failed: {dlq_err}")
+
+
 def _run_crm(*args: str) -> str:
     """Вызвать run_crm.py и вернуть stdout."""
     try:
@@ -1040,9 +1056,15 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
-    result = run_pipeline(args)
-    if result:
-        print(result)
+    raw_payload = json.dumps(vars(args), default=str)
+    try:
+        result = run_pipeline(args)
+        if result:
+            print(result)
+    except Exception as e:
+        log(f"UNHANDLED ERROR: {e}")
+        store_dlq_failure(raw_payload, "pipeline", str(e))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

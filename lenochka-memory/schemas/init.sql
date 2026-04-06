@@ -327,3 +327,20 @@ CREATE TABLE IF NOT EXISTS load_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_load_sessions_status ON load_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_load_sessions_chat ON load_sessions(chat_id, owner_id);
+
+-- ============================================
+-- Dead-Letter Queue
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS failed_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_payload TEXT,           -- JSON с аргументами пайплайна
+    stage       TEXT NOT NULL,  -- на каком шаге упало: normalize/ingest/store/crm/response
+    error       TEXT NOT NULL,  -- текст исключения
+    retry_count INTEGER DEFAULT 0,
+    resolved    INTEGER DEFAULT 0,  -- 1 = разобрано вручную
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_failed_messages_resolved
+    ON failed_messages(resolved, created_at);
